@@ -486,4 +486,184 @@ mod tests {
         assert_eq!(recorded.recipient, "researcher");
         assert!(recorded.content.contains("Investigate security boundary"));
     }
+
+    #[test]
+    fn test_headless_rendering_scheduler_empty() {
+        for (w, h) in [(120, 40), (80, 24), (50, 15)] {
+            let backend = TestBackend::new(w, h);
+            let mut terminal = Terminal::new(backend).expect("create test terminal");
+            let mut app = App::new(None);
+            app.set_tab(ActiveTab::Scheduler);
+
+            terminal
+                .draw(|f| ui::render(f, &app))
+                .expect("draw scheduler empty");
+
+            let buffer = terminal.backend().buffer();
+            let content: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+            assert!(content.contains("Cron Scheduler Monitor"));
+            assert!(content.contains("Scheduled Jobs (0)"));
+        }
+    }
+
+    #[test]
+    fn test_headless_rendering_scheduler_populated() {
+        use chrono::Utc;
+        use cortex_runtime::{JobRunRecord, JobRunStatus, JobStatus, OverlapPolicy, ScheduledJob};
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut app = App::new(None);
+        app.set_tab(ActiveTab::Scheduler);
+
+        let now = Utc::now();
+        let job1_id = cortex_core::JobId::from("job-nightly-01");
+        let job2_id = cortex_core::JobId::from("job-oneshot-02");
+
+        let job1 = ScheduledJob {
+            id: job1_id.clone(),
+            name: "Nightly Evaluator".to_string(),
+            schedule: "0 2 * * *".to_string(),
+            prompt: "@eval-01 Run full benchmark matrix".to_string(),
+            overlap_policy: OverlapPolicy::Skip,
+            status: JobStatus::Active,
+            next_run_at: Some(now + chrono::Duration::hours(4)),
+            last_run_at: Some(now - chrono::Duration::hours(20)),
+            created_at: now - chrono::Duration::days(2),
+            updated_at: now - chrono::Duration::hours(20),
+            agent_id: Some(cortex_core::AgentId::from("eval-01")),
+        };
+
+        let job2 = ScheduledJob {
+            id: job2_id.clone(),
+            name: "One-shot Migration".to_string(),
+            schedule: "@once 2026-10-15T00:00:00Z".to_string(),
+            prompt: "@coder-01 Apply schema patch".to_string(),
+            overlap_policy: OverlapPolicy::Replace,
+            status: JobStatus::Paused,
+            next_run_at: Some(now + chrono::Duration::days(3)),
+            last_run_at: None,
+            created_at: now - chrono::Duration::days(1),
+            updated_at: now - chrono::Duration::days(1),
+            agent_id: Some(cortex_core::AgentId::from("coder-01")),
+        };
+
+        app.cron_jobs = vec![job1, job2];
+
+        // Populate execution runs for job 1
+        app.cron_job_runs = vec![
+            JobRunRecord {
+                id: "run-exec-001".to_string(),
+                job_id: job1_id.clone(),
+                status: JobRunStatus::Completed,
+                started_at: now - chrono::Duration::minutes(50),
+                finished_at: Some(now - chrono::Duration::minutes(48)),
+                duration_ms: Some(120_000),
+                output: Some("Evaluations completed with 100% pass rate".to_string()),
+                error: None,
+                run_id: None,
+            },
+            JobRunRecord {
+                id: "run-exec-002".to_string(),
+                job_id: job1_id,
+                status: JobRunStatus::Failed,
+                started_at: now - chrono::Duration::minutes(30),
+                finished_at: Some(now - chrono::Duration::minutes(29)),
+                duration_ms: Some(60_000),
+                output: None,
+                error: Some("Context timeout exceeded".to_string()),
+                run_id: None,
+            },
+        ];
+
+        // 1. Render with drawer closed
+        app.cron_drawer_open = false;
+        terminal
+            .draw(|f| ui::render(f, &app))
+            .expect("draw populated scheduler drawer closed");
+
+        let content_closed: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content_closed.contains("Nightly Evaluator"));
+        assert!(content_closed.contains("One-shot Migration"));
+        assert!(content_closed.contains("0 2 * * *"));
+        assert!(content_closed.contains("[ACTIVE]"));
+        assert!(content_closed.contains("[PAUSED]"));
+        assert!(content_closed.contains("eval-01"));
+
+        // 2. Render with drawer open
+        app.cron_drawer_open = true;
+        terminal
+            .draw(|f| ui::render(f, &app))
+            .expect("draw populated scheduler drawer open");
+
+        let content_open: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content_open.contains("Execution Runs"));
+        assert!(content_open.contains("run-exec-001"));
+        assert!(content_open.contains("[DONE]"));
+        assert!(content_open.contains("[FAILED]"));
+        assert!(content_open.contains("Run Inspector"));
+    }
+
+    #[test]
+    fn test_scheduler_sqlite_store_integration_and_zero_lag() {
+        use chrono::Utc;
+        use cortex_runtime::{JobStatus, OverlapPolicy, RunStore, ScheduledJob};
+
+        let store = std::sync::Arc::new(RunStore::in_memory().expect("in memory store"));
+        let job = ScheduledJob {
+            id: cortex_core::JobId::from("job-sql-01"),
+            name: "Automated Backup".to_string(),
+            schedule: "*/30 * * * *".to_string(),
+            prompt: "Back up repository snapshot".to_string(),
+            overlap_policy: OverlapPolicy::Queue,
+            status: JobStatus::Active,
+            next_run_at: Some(Utc::now() + chrono::Duration::minutes(10)),
+            last_run_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            agent_id: None,
+        };
+
+        store.save_cron_job(&job).expect("save job");
+        store
+            .record_cron_run_start("cron-run-sql-01", &job.id, &Utc::now().to_rfc3339(), None)
+            .expect("record run start");
+        store
+            .record_cron_run_finish(
+                "cron-run-sql-01",
+                "completed",
+                &Utc::now().to_rfc3339(),
+                Some(1500),
+                Some("Snapshot backed up successfully"),
+                None,
+            )
+            .expect("record run finish");
+
+        let mut app = App::new(Some(store));
+        app.set_tab(ActiveTab::Scheduler);
+        assert_eq!(app.cron_jobs.len(), 1);
+        assert_eq!(app.cron_jobs[0].name, "Automated Backup");
+        assert_eq!(app.cron_job_runs.len(), 1);
+        assert_eq!(app.cron_job_runs[0].id, "cron-run-sql-01");
+
+        // Toggle pause
+        app.toggle_pause_selected_cron_job();
+        assert_eq!(app.cron_jobs[0].status, JobStatus::Paused);
+
+        // Toggle resume
+        app.toggle_pause_selected_cron_job();
+        assert_eq!(app.cron_jobs[0].status, JobStatus::Active);
+    }
 }

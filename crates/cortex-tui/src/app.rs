@@ -33,6 +33,8 @@ pub enum ActiveTab {
     Chat,
     /// Model provider and custom inference portal configuration.
     Portals,
+    /// Background cron jobs and scheduled execution monitor.
+    Scheduler,
 }
 
 impl ActiveTab {
@@ -47,6 +49,7 @@ impl ActiveTab {
             ActiveTab::Tasks,
             ActiveTab::Chat,
             ActiveTab::Portals,
+            ActiveTab::Scheduler,
         ]
     }
 
@@ -61,6 +64,7 @@ impl ActiveTab {
             ActiveTab::Tasks => "6: Tasks & Bench",
             ActiveTab::Chat => "7: Agent Chat",
             ActiveTab::Portals => "8: Portals",
+            ActiveTab::Scheduler => "9: Scheduler",
         }
     }
 }
@@ -772,6 +776,18 @@ pub struct App {
     // Multi-Agent Coordination
     /// Live multi-agent team coordination, topology, DAG pipeline, and message feed.
     pub coordination: MultiAgentCoordination,
+
+    // Scheduler & Background Job State
+    /// Registered scheduled jobs loaded from storage.
+    pub cron_jobs: Vec<cortex_runtime::ScheduledJob>,
+    /// Index of currently selected scheduled job.
+    pub selected_cron_job_idx: usize,
+    /// Execution runs recorded for the selected scheduled job.
+    pub cron_job_runs: Vec<cortex_runtime::JobRunRecord>,
+    /// Index of currently selected execution run in drawer.
+    pub selected_cron_run_idx: usize,
+    /// Whether the execution run drawer is expanded / focused.
+    pub cron_drawer_open: bool,
 }
 
 impl App {
@@ -868,6 +884,11 @@ impl App {
                 idx
             },
             coordination: MultiAgentCoordination::default(),
+            cron_jobs: Vec::new(),
+            selected_cron_job_idx: 0,
+            cron_job_runs: Vec::new(),
+            selected_cron_run_idx: 0,
+            cron_drawer_open: false,
         };
 
         // Ensure user settings file exists in ~/.cortex
@@ -1015,6 +1036,7 @@ impl App {
             }
 
             self.refresh_events();
+            self.refresh_cron_jobs();
         }
     }
 
@@ -1032,6 +1054,40 @@ impl App {
                 }
             } else {
                 self.events.clear();
+            }
+        }
+    }
+
+    /// Refresh registered cron jobs from SQLite and sync execution runs.
+    pub fn refresh_cron_jobs(&mut self) {
+        if let Some(store) = &self.store {
+            if let Ok(jobs) = store.list_cron_jobs() {
+                self.cron_jobs = jobs;
+                if self.selected_cron_job_idx >= self.cron_jobs.len() && !self.cron_jobs.is_empty()
+                {
+                    self.selected_cron_job_idx = self.cron_jobs.len() - 1;
+                }
+            }
+            self.refresh_cron_job_runs();
+        }
+    }
+
+    /// Refresh execution runs for the currently selected scheduled job.
+    pub fn refresh_cron_job_runs(&mut self) {
+        if let Some(store) = &self.store {
+            if let Some(job) = self.cron_jobs.get(self.selected_cron_job_idx) {
+                if let Ok(runs) = store.list_cron_job_runs(&job.id, 50) {
+                    self.cron_job_runs = runs;
+                    if self.selected_cron_run_idx >= self.cron_job_runs.len()
+                        && !self.cron_job_runs.is_empty()
+                    {
+                        self.selected_cron_run_idx = self.cron_job_runs.len() - 1;
+                    }
+                } else {
+                    self.cron_job_runs.clear();
+                }
+            } else {
+                self.cron_job_runs.clear();
             }
         }
     }
@@ -1091,6 +1147,20 @@ impl App {
             ActiveTab::Chat => {
                 self.chat_scroll_down();
             }
+            ActiveTab::Scheduler => {
+                if self.cron_drawer_open {
+                    if !self.cron_job_runs.is_empty()
+                        && self.selected_cron_run_idx + 1 < self.cron_job_runs.len()
+                    {
+                        self.selected_cron_run_idx += 1;
+                    }
+                } else if !self.cron_jobs.is_empty()
+                    && self.selected_cron_job_idx + 1 < self.cron_jobs.len()
+                {
+                    self.selected_cron_job_idx += 1;
+                    self.refresh_cron_job_runs();
+                }
+            }
             ActiveTab::ActiveRun => {}
         }
     }
@@ -1125,6 +1195,16 @@ impl App {
             ActiveTab::Chat => {
                 self.chat_scroll_up();
             }
+            ActiveTab::Scheduler => {
+                if self.cron_drawer_open {
+                    if self.selected_cron_run_idx > 0 {
+                        self.selected_cron_run_idx -= 1;
+                    }
+                } else if self.selected_cron_job_idx > 0 {
+                    self.selected_cron_job_idx -= 1;
+                    self.refresh_cron_job_runs();
+                }
+            }
             ActiveTab::ActiveRun => {}
         }
     }
@@ -1138,7 +1218,129 @@ impl App {
             ActiveTab::Portals => {
                 self.activate_selected_portal();
             }
+            ActiveTab::Scheduler => {
+                self.toggle_cron_drawer();
+            }
             _ => {}
+        }
+    }
+
+    /// Toggle the execution run drawer for the selected scheduled job.
+    pub fn toggle_cron_drawer(&mut self) {
+        self.cron_drawer_open = !self.cron_drawer_open;
+        if self.cron_drawer_open {
+            self.refresh_cron_job_runs();
+        }
+    }
+
+    /// Close the execution run drawer.
+    pub fn close_cron_drawer(&mut self) {
+        self.cron_drawer_open = false;
+    }
+
+    /// Currently selected scheduled job, if any.
+    pub fn selected_cron_job(&self) -> Option<&cortex_runtime::ScheduledJob> {
+        self.cron_jobs.get(self.selected_cron_job_idx)
+    }
+
+    /// Currently selected execution run record, if any.
+    pub fn selected_cron_run(&self) -> Option<&cortex_runtime::JobRunRecord> {
+        self.cron_job_runs.get(self.selected_cron_run_idx)
+    }
+
+    /// Toggle pause / resume status of the selected scheduled job in SQLite.
+    pub fn toggle_pause_selected_cron_job(&mut self) {
+        if let Some(store) = &self.store {
+            if let Some(job) = self.cron_jobs.get(self.selected_cron_job_idx) {
+                let engine = cortex_runtime::SchedulerEngine::new(Arc::clone(store));
+                let res = match job.status {
+                    cortex_runtime::JobStatus::Paused => engine.resume_job(&job.id),
+                    _ => engine.pause_job(&job.id),
+                };
+                if let Ok(updated) = res {
+                    if updated {
+                        let new_state = if job.status == cortex_runtime::JobStatus::Paused {
+                            "resumed"
+                        } else {
+                            "paused"
+                        };
+                        self.status_message = Some(format!("Job '{}' {}.", job.name, new_state));
+                        self.refresh_cron_jobs();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Trigger the selected scheduled job immediately.
+    pub fn trigger_selected_cron_job(&mut self) {
+        if let Some(store) = &self.store {
+            if let Some(job) = self.cron_jobs.get(self.selected_cron_job_idx) {
+                let engine = cortex_runtime::SchedulerEngine::new(Arc::clone(store));
+                match engine.trigger_job(&job.id, chrono::Utc::now()) {
+                    Ok(res) => {
+                        self.status_message =
+                            Some(format!("Triggered job '{}': {:?}", job.name, res));
+                        self.refresh_cron_jobs();
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Failed to trigger job: {}", e).into();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Resolve the target agent identifier for a scheduled job.
+    pub fn resolve_target_agent(&self, job: &cortex_runtime::ScheduledJob) -> String {
+        if let Some(agent_id) = &job.agent_id {
+            return agent_id.as_str().to_string();
+        }
+        if let Some(rest) = job.prompt.strip_prefix('@') {
+            if let Some(target) = rest.split_whitespace().next() {
+                return target.to_string();
+            }
+        }
+        if let Some(agent) = self.agents.first() {
+            agent.id.clone()
+        } else {
+            "default".to_string()
+        }
+    }
+
+    /// Format human-readable countdown string until the next fire timestamp.
+    pub fn format_fire_countdown(
+        next_run_at: Option<chrono::DateTime<chrono::Utc>>,
+        status: cortex_runtime::JobStatus,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> String {
+        match status {
+            cortex_runtime::JobStatus::Paused => "Paused".to_string(),
+            cortex_runtime::JobStatus::Completed => "Completed".to_string(),
+            cortex_runtime::JobStatus::Active => match next_run_at {
+                None => "-".to_string(),
+                Some(target) => {
+                    if target <= now {
+                        "Due now".to_string()
+                    } else {
+                        let diff = target - now;
+                        let days = diff.num_days();
+                        let hours = diff.num_hours();
+                        let minutes = diff.num_minutes();
+                        let seconds = diff.num_seconds();
+
+                        if days > 0 {
+                            format!("in {}d {}h", days, hours % 24)
+                        } else if hours > 0 {
+                            format!("in {}h {}m", hours, minutes % 60)
+                        } else if minutes > 0 {
+                            format!("in {}m {}s", minutes, seconds % 60)
+                        } else {
+                            format!("in {}s", seconds.max(0))
+                        }
+                    }
+                }
+            },
         }
     }
 
@@ -2323,6 +2525,38 @@ mod tests {
 
         app.set_tab(ActiveTab::Portals);
         assert_eq!(app.active_tab, ActiveTab::Portals);
+
+        app.set_tab(ActiveTab::Scheduler);
+        assert_eq!(app.active_tab, ActiveTab::Scheduler);
+        assert_eq!(app.active_tab.label(), "9: Scheduler");
+    }
+
+    #[test]
+    fn test_scheduler_state_and_countdown_formatting() {
+        let mut app = App::new(None);
+        assert_eq!(app.cron_jobs.len(), 0);
+        assert_eq!(app.cron_job_runs.len(), 0);
+        assert!(!app.cron_drawer_open);
+
+        app.set_tab(ActiveTab::Scheduler);
+        app.select_current();
+        assert!(app.cron_drawer_open);
+        app.close_cron_drawer();
+        assert!(!app.cron_drawer_open);
+
+        let now = chrono::Utc::now();
+        let next_run = now + chrono::Duration::minutes(15);
+        let countdown =
+            App::format_fire_countdown(Some(next_run), cortex_runtime::JobStatus::Active, now);
+        assert!(countdown.contains("15m") || countdown.contains("14m"));
+
+        let paused_countdown =
+            App::format_fire_countdown(Some(next_run), cortex_runtime::JobStatus::Paused, now);
+        assert_eq!(paused_countdown, "Paused");
+
+        let completed_countdown =
+            App::format_fire_countdown(Some(next_run), cortex_runtime::JobStatus::Completed, now);
+        assert_eq!(completed_countdown, "Completed");
     }
 
     #[test]

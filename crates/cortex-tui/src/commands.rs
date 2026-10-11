@@ -103,6 +103,12 @@ pub static COMMAND_CATALOG: &[CommandDefinition] = &[
         aliases: &["coordination", "agents-team"],
     },
     CommandDefinition {
+        name: "cron",
+        description: "View background cron jobs and scheduled triggers",
+        usage: "/cron [list|view|runs <job-id>]",
+        aliases: &["scheduler", "jobs"],
+    },
+    CommandDefinition {
         name: "exit",
         description: "Exit interactive agent harness",
         usage: "/exit",
@@ -194,6 +200,11 @@ pub enum SlashCommand {
         /// Subcommand arguments.
         args: Vec<String>,
     },
+    /// Background cron jobs and scheduled execution monitor.
+    Cron {
+        /// Subcommand arguments.
+        args: Vec<String>,
+    },
     /// Exit the TUI harness.
     Quit,
     /// Unrecognized slash command.
@@ -242,6 +253,7 @@ pub fn parse_command(input: &str) -> Option<SlashCommand> {
             Some(SlashCommand::Resume { id })
         }
         "team" | "coordination" => Some(SlashCommand::Team { args }),
+        "cron" | "scheduler" | "jobs" => Some(SlashCommand::Cron { args }),
         "quit" | "exit" | "q" => Some(SlashCommand::Quit),
         other => Some(SlashCommand::Unknown(other.to_string())),
     }
@@ -270,6 +282,7 @@ pub fn execute_command(app: &mut App, command: SlashCommand) -> String {
         SlashCommand::Sessions => handle_sessions_command(),
         SlashCommand::Resume { id } => handle_resume_command(app, &id),
         SlashCommand::Team { args } => handle_team_command(app, &args),
+        SlashCommand::Cron { args } => handle_scheduler_command(app, &args),
         SlashCommand::Quit => {
             app.should_quit = true;
             "Exiting Cortex TUI... Goodbye!".to_string()
@@ -314,6 +327,7 @@ fn format_help() -> String {
 │    /dashboard                  Runtime metrics, completed runs & success card│
 │    /doctor                     Check API keys, git status & health checks    │
 │    /cost                       Display token usage & cost summary            │
+│    /cron [list|view|runs]      Scheduled cron monitor, next countdown & runs │
 │                                                                          │
 │  ⚡ HARNESS & DISPLAY CONTROLS                                            │
 │    /thinking [on|off]          Toggle or set expandable thinking trace view  │
@@ -1308,12 +1322,151 @@ fn handle_doctor_command(app: &App) -> String {
     )
 }
 
+fn handle_scheduler_command(app: &mut App, args: &[String]) -> String {
+    let now = chrono::Utc::now();
+    app.refresh_cron_jobs();
+
+    if let Some(sub) = args.first() {
+        match sub.to_lowercase().as_str() {
+            "view" | "open" | "show" => {
+                app.set_tab(crate::app::ActiveTab::Scheduler);
+                return "✓ Switched to interactive Scheduler control plane (Tab 9). Press [Enter] to open Execution Drawer, [Esc] to exit.".to_string();
+            }
+            "runs" => {
+                let target_job = if args.len() >= 2 {
+                    let target_id = args[1].trim();
+                    app.cron_jobs.iter().find(|j| {
+                        j.id.as_str().eq_ignore_ascii_case(target_id)
+                            || j.name.eq_ignore_ascii_case(target_id)
+                    })
+                } else {
+                    app.cron_jobs.first()
+                };
+
+                if let Some(job) = target_job {
+                    let runs = if let Some(store) = &app.store {
+                        store.list_cron_job_runs(&job.id, 10).unwrap_or_default()
+                    } else {
+                        app.cron_job_runs.clone()
+                    };
+
+                    let mut out = format!(
+                        "┌── ◈ RECENT EXECUTION RUNS: {} ({}) ───────────────────┐\n",
+                        job.name,
+                        job.id.as_str()
+                    );
+                    if runs.is_empty() {
+                        out.push_str(
+                            "│ No execution runs recorded for this scheduled job yet.                     │\n",
+                        );
+                    } else {
+                        for r in &runs {
+                            let dur_str = r
+                                .duration_ms
+                                .map(|d| format!("{}ms", d))
+                                .unwrap_or_else(|| "-".to_string());
+                            let status_badge = format!("[{}]", r.status.as_str().to_uppercase());
+                            out.push_str(&format!(
+                                "│ • {:<18} {:<9} Started: {:<10} Dur: {:<7}│\n",
+                                r.id,
+                                status_badge,
+                                r.started_at.format("%H:%M:%S"),
+                                dur_str,
+                            ));
+                            if let Some(out_text) = &r.output {
+                                let line = out_text.lines().next().unwrap_or(out_text);
+                                let preview = if line.len() > 50 { &line[..47] } else { line };
+                                out.push_str(&format!("│   Output: {:<58}│\n", preview));
+                            } else if let Some(err_text) = &r.error {
+                                let preview = if err_text.len() > 50 {
+                                    &err_text[..47]
+                                } else {
+                                    err_text
+                                };
+                                out.push_str(&format!("│   Error : {:<58}│\n", preview));
+                            }
+                        }
+                    }
+                    out.push_str(
+                        "└────────────────────────────────────────────────────────────────────────┘",
+                    );
+                    return out;
+                } else {
+                    return "No matching scheduled job found. Use '/cron' to list all jobs."
+                        .to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Default: format table card of scheduled jobs
+    let mut out =
+        String::from("┌── ⏱ CORTEX CRON SCHEDULER & BACKGROUND JOBS ──────────────────────────┐\n");
+    let active_count = app
+        .cron_jobs
+        .iter()
+        .filter(|j| j.status == cortex_runtime::JobStatus::Active)
+        .count();
+    let total_count = app.cron_jobs.len();
+    out.push_str(&format!(
+        "│ Total Registered: {:<14} Active: {:<14} Store: {:<12}│\n├────────────────────────────────────────────────────────────────────────┤\n",
+        total_count,
+        active_count,
+        if app.store.is_some() { "SQLite" } else { "In-Memory" },
+    ));
+
+    if app.cron_jobs.is_empty() {
+        out.push_str("│ No background cron jobs registered in SQLite store.                   │\n");
+        out.push_str(
+            "│ Use Scheduler API or 'cortex run --schedule' to register jobs.         │\n",
+        );
+    } else {
+        for job in &app.cron_jobs {
+            let countdown =
+                crate::app::App::format_fire_countdown(job.next_run_at, job.status, now);
+            let agent = app.resolve_target_agent(job);
+            let status_badge = match job.status {
+                cortex_runtime::JobStatus::Active => "[ACTIVE]",
+                cortex_runtime::JobStatus::Paused => "[PAUSED]",
+                cortex_runtime::JobStatus::Completed => "[DONE]  ",
+            };
+            let overlap = match job.overlap_policy {
+                cortex_runtime::OverlapPolicy::Skip => "skip",
+                cortex_runtime::OverlapPolicy::Queue => "queue",
+                cortex_runtime::OverlapPolicy::Replace => "replace",
+            };
+
+            out.push_str(&format!(
+                "│ • {:<16} {:<10} {:<14} Next: {:<19}│\n\
+                 │   ID: {:<20} Agent: {:<12} Overlap: {:<14}│\n",
+                if job.name.len() > 16 {
+                    &job.name[..16]
+                } else {
+                    &job.name
+                },
+                status_badge,
+                job.schedule,
+                countdown,
+                job.id.as_str(),
+                agent,
+                overlap,
+            ));
+        }
+    }
+
+    out.push_str("└────────────────────────────────────────────────────────────────────────┘\n\
+                  Use '/cron view' to open Scheduler Control Plane tab, or '/cron runs <id>' for history.");
+    out
+}
+
 /// Curated primary slash commands for autocomplete.
 pub const ALL_COMMANDS: &[&str] = &[
     "/agents",
     "/clear",
     "/compact",
     "/cost",
+    "/cron",
     "/dashboard",
     "/diff",
     "/doctor",
@@ -1332,6 +1485,7 @@ const MODEL_SUBCOMMANDS: &[&str] = &["info", "list", "set"];
 const PORTAL_SUBCOMMANDS: &[&str] = &["add", "list", "set-key", "set-url", "test", "use"];
 const AGENT_SUBCOMMANDS: &[&str] = &["add", "inspect", "list", "pause", "start", "stop"];
 const THINKING_SUBCOMMANDS: &[&str] = &["off", "on", "toggle"];
+const CRON_SUBCOMMANDS: &[&str] = &["list", "runs", "view"];
 
 /// Autocomplete a partial slash command input.
 pub fn autocomplete_command(input: &str) -> Option<String> {
@@ -1364,6 +1518,7 @@ pub fn autocomplete_command(input: &str) -> Option<String> {
             "/model" | "/models" => MODEL_SUBCOMMANDS,
             "/portal" | "/portals" => PORTAL_SUBCOMMANDS,
             "/agent" | "/agents" => AGENT_SUBCOMMANDS,
+            "/cron" | "/scheduler" | "/jobs" => CRON_SUBCOMMANDS,
             "/thinking" | "/think" => THINKING_SUBCOMMANDS,
             _ => &[],
         };
@@ -1424,6 +1579,16 @@ mod tests {
         assert_eq!(parse_command("/doctor"), Some(SlashCommand::Doctor));
         assert_eq!(parse_command("/cost"), Some(SlashCommand::Cost));
         assert_eq!(parse_command("/clear"), Some(SlashCommand::Clear));
+        assert_eq!(
+            parse_command("/cron"),
+            Some(SlashCommand::Cron { args: vec![] })
+        );
+        assert_eq!(
+            parse_command("/scheduler view"),
+            Some(SlashCommand::Cron {
+                args: vec!["view".to_string()]
+            })
+        );
         assert_eq!(parse_command("/quit"), Some(SlashCommand::Quit));
         assert_eq!(
             parse_command("/foobar"),
@@ -1456,6 +1621,18 @@ mod tests {
 
         let tasks = execute_command(&mut app, SlashCommand::Tasks);
         assert!(tasks.contains("BENCHMARK EVALUATION TASKS"));
+
+        let cron_card = execute_command(&mut app, SlashCommand::Cron { args: vec![] });
+        assert!(cron_card.contains("CRON SCHEDULER"));
+
+        let cron_view = execute_command(
+            &mut app,
+            SlashCommand::Cron {
+                args: vec!["view".to_string()],
+            },
+        );
+        assert!(cron_view.contains("Switched to interactive Scheduler"));
+        assert_eq!(app.active_tab, crate::app::ActiveTab::Scheduler);
 
         // Toggle thinking
         let think = execute_command(&mut app, SlashCommand::Thinking { arg: None });
@@ -1494,6 +1671,11 @@ mod tests {
         assert_eq!(autocomplete_command("/m"), Some("/model ".to_string()));
         assert_eq!(autocomplete_command("/p"), Some("/portal ".to_string()));
         assert_eq!(autocomplete_command("/a"), Some("/agents ".to_string()));
+        assert_eq!(autocomplete_command("/cr"), Some("/cron ".to_string()));
+        assert_eq!(
+            autocomplete_command("/cron v"),
+            Some("/cron view ".to_string())
+        );
         assert_eq!(autocomplete_command("/di"), Some("/diff ".to_string()));
         assert_eq!(autocomplete_command("/q"), Some("/quit ".to_string()));
         assert_eq!(autocomplete_command("/h"), Some("/help ".to_string()));

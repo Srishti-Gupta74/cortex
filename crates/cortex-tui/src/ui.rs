@@ -20,7 +20,34 @@ use ratatui::Frame;
 /// In Cortex's modern CLI architecture (inspired by Claude Code, Cursor CLI, and Gemini CLI),
 /// the interface is a dedicated conversational harness with slash commands and zero top tabs.
 pub fn render(frame: &mut Frame, app: &App) {
-    render_chat(frame, app, frame.area());
+    if app.active_tab == ActiveTab::Chat {
+        render_chat(frame, app, frame.area());
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // Header & Tabs
+                Constraint::Min(12),   // Main content
+                Constraint::Length(3), // Footer & Keybindings
+            ])
+            .split(frame.area());
+
+        render_header(frame, app, chunks[0]);
+
+        match app.active_tab {
+            ActiveTab::Dashboard => render_dashboard(frame, app, chunks[1]),
+            ActiveTab::Agents => render_agents(frame, app, chunks[1]),
+            ActiveTab::ActiveRun => render_active_run(frame, app, chunks[1]),
+            ActiveTab::Events => render_events(frame, app, chunks[1]),
+            ActiveTab::History => render_history(frame, app, chunks[1]),
+            ActiveTab::Tasks => render_tasks(frame, app, chunks[1]),
+            ActiveTab::Chat => render_chat(frame, app, chunks[1]),
+            ActiveTab::Portals => render_portals(frame, app, chunks[1]),
+            ActiveTab::Scheduler => render_scheduler(frame, app, chunks[1]),
+        }
+
+        render_footer(frame, app, chunks[2]);
+    }
 }
 
 #[allow(dead_code)]
@@ -2139,8 +2166,30 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
                 ]
             }
         }
+        ActiveTab::Scheduler => vec![
+            Span::styled("Tab / 1-9", Style::default().fg(Color::Yellow)),
+            Span::raw(": Tabs | "),
+            Span::styled("↑/↓ / j/k", Style::default().fg(Color::Yellow)),
+            Span::raw(": Select | "),
+            Span::styled("Enter", Style::default().fg(Color::Yellow)),
+            Span::raw(if app.cron_drawer_open {
+                ": Close Drawer | "
+            } else {
+                ": Open Drawer | "
+            }),
+            Span::styled("Esc", Style::default().fg(Color::Yellow)),
+            Span::raw(": Drawer/Dash | "),
+            Span::styled("p", Style::default().fg(Color::Yellow)),
+            Span::raw(": Pause/Resume | "),
+            Span::styled("t", Style::default().fg(Color::Yellow)),
+            Span::raw(": Trigger Now | "),
+            Span::styled("r", Style::default().fg(Color::Yellow)),
+            Span::raw(": Refresh | "),
+            Span::styled("q", Style::default().fg(Color::Yellow)),
+            Span::raw(": Quit"),
+        ],
         _ => vec![
-            Span::styled("Tab / 1-8", Style::default().fg(Color::Yellow)),
+            Span::styled("Tab / 1-9", Style::default().fg(Color::Yellow)),
             Span::raw(": Switch Tabs | "),
             Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
             Span::raw(": Navigate | "),
@@ -2233,5 +2282,626 @@ fn event_preview(event: &ExecutionEvent) -> String {
         ExecutionEvent::AgentError { error, .. } => format!("Error: {}", error),
         ExecutionEvent::RunCompleted { final_answer, .. } => format!("Completed: {}", final_answer),
         ExecutionEvent::RunCancelled { reason, .. } => format!("Cancelled: {}", reason),
+    }
+}
+
+/// Render the Cron Scheduler Monitor screen and Execution Run Drawer.
+pub fn render_scheduler(frame: &mut Frame, app: &App, area: Rect) {
+    let now = chrono::Utc::now();
+    let total_jobs = app.cron_jobs.len();
+    let active_jobs = app
+        .cron_jobs
+        .iter()
+        .filter(|j| j.status == cortex_runtime::JobStatus::Active)
+        .count();
+    let paused_jobs = app
+        .cron_jobs
+        .iter()
+        .filter(|j| j.status == cortex_runtime::JobStatus::Paused)
+        .count();
+    let completed_jobs = app
+        .cron_jobs
+        .iter()
+        .filter(|j| j.status == cortex_runtime::JobStatus::Completed)
+        .count();
+
+    let next_trigger_str = app
+        .cron_jobs
+        .iter()
+        .filter(|j| j.status == cortex_runtime::JobStatus::Active)
+        .filter_map(|j| j.next_run_at)
+        .min()
+        .map(|dt| App::format_fire_countdown(Some(dt), cortex_runtime::JobStatus::Active, now))
+        .unwrap_or_else(|| "-".to_string());
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(8)])
+        .split(area);
+
+    // 1. Top Metrics Bar
+    let metrics_text = Line::from(vec![
+        Span::styled(" Total Jobs: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            total_jobs.to_string(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" │ "),
+        Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            active_jobs.to_string(),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" │ "),
+        Span::styled("Paused: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            paused_jobs.to_string(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" │ "),
+        Span::styled("Completed: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            completed_jobs.to_string(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" │ "),
+        Span::styled("Next Fire: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            next_trigger_str,
+            Style::default()
+                .fg(Color::LightCyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let metrics_block = Paragraph::new(metrics_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(" ⏱ Cron Scheduler Monitor ")
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+    );
+    frame.render_widget(metrics_block, chunks[0]);
+
+    // 2. Main content area: split between Scheduled Jobs Table and Execution Run Drawer
+    let (table_area, drawer_area) = if app.cron_drawer_open {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+        (split[0], Some(split[1]))
+    } else if chunks[1].height >= 14 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+            .split(chunks[1]);
+        (split[0], Some(split[1]))
+    } else {
+        (chunks[1], None)
+    };
+
+    render_cron_jobs_table(frame, app, table_area, now);
+
+    if let Some(d_area) = drawer_area {
+        render_cron_drawer(frame, app, d_area);
+    }
+}
+
+fn render_cron_jobs_table(
+    frame: &mut Frame,
+    app: &App,
+    area: Rect,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    if app.cron_jobs.is_empty() {
+        let empty_msg = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "No registered cron jobs or one-shot timers found in SQLite store.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Schedule jobs using the Scheduler API or 'cortex run --schedule \"<cron>\" <prompt>'",
+                Style::default().fg(Color::Gray),
+            )),
+        ];
+        let p = Paragraph::new(empty_msg)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Scheduled Jobs (0) ")
+                    .title_style(Style::default().fg(Color::Yellow)),
+            )
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let rows: Vec<Row> = app
+        .cron_jobs
+        .iter()
+        .enumerate()
+        .map(|(idx, job)| {
+            let is_selected = idx == app.selected_cron_job_idx;
+            let row_style = if is_selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            let (status_badge, status_style) = match job.status {
+                cortex_runtime::JobStatus::Active => (
+                    "[ACTIVE]",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                cortex_runtime::JobStatus::Paused => (
+                    "[PAUSED]",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                cortex_runtime::JobStatus::Completed => (
+                    "[DONE]  ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            };
+
+            let countdown = App::format_fire_countdown(job.next_run_at, job.status, now);
+            let countdown_style = if countdown.starts_with("Due") {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else if job.status == cortex_runtime::JobStatus::Paused {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::LightCyan)
+            };
+
+            let overlap_badge = match job.overlap_policy {
+                cortex_runtime::OverlapPolicy::Skip => "Skip",
+                cortex_runtime::OverlapPolicy::Queue => "Queue",
+                cortex_runtime::OverlapPolicy::Replace => "Replace",
+            };
+
+            let target_agent = app.resolve_target_agent(job);
+            let job_label = format!("{} ({})", job.name, job.id.as_str());
+
+            Row::new(vec![
+                Cell::from(job_label),
+                Cell::from(job.schedule.clone()).style(Style::default().fg(Color::Yellow)),
+                Cell::from(countdown).style(countdown_style),
+                Cell::from(target_agent).style(Style::default().fg(Color::Cyan)),
+                Cell::from(overlap_badge).style(Style::default().fg(Color::Magenta)),
+                Cell::from(Span::styled(status_badge, status_style)),
+            ])
+            .style(row_style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(28),
+            Constraint::Percentage(18),
+            Constraint::Percentage(16),
+            Constraint::Percentage(16),
+            Constraint::Percentage(11),
+            Constraint::Percentage(11),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "Job Name / ID",
+            "Schedule Expression",
+            "Next Fire",
+            "Target Agent",
+            "Overlap",
+            "Status",
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .title(format!(
+                " Registered Scheduled Jobs ({}) {} ",
+                app.cron_jobs.len(),
+                if app.cron_drawer_open {
+                    "[Drawer Active - Esc to Close]"
+                } else {
+                    "[Press Enter to inspect Execution Drawer]"
+                }
+            ))
+            .title_style(
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+    );
+
+    frame.render_widget(table, area);
+}
+
+fn render_cron_drawer(frame: &mut Frame, app: &App, area: Rect) {
+    let job = match app.selected_cron_job() {
+        Some(j) => j,
+        None => {
+            let p = Paragraph::new("No job selected.").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Execution Runs Drawer "),
+            );
+            frame.render_widget(p, area);
+            return;
+        }
+    };
+
+    if !app.cron_drawer_open {
+        let runs_count = app.cron_job_runs.len();
+        let prompt_preview = if job.prompt.len() > 100 {
+            format!("{}...", &job.prompt[..97])
+        } else {
+            job.prompt.clone()
+        };
+
+        let last_run_desc = job
+            .last_run_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "Never".to_string());
+
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Selected Job: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    &job.name,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" ("),
+                Span::styled(job.id.as_str(), Style::default().fg(Color::Yellow)),
+                Span::raw(") │ "),
+                Span::styled("Last Run: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(last_run_desc, Style::default().fg(Color::LightCyan)),
+                Span::raw(" │ "),
+                Span::styled("Recorded Runs: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    runs_count.to_string(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Task Prompt : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(prompt_preview, Style::default().fg(Color::Gray)),
+            ]),
+            Line::from(vec![
+                Span::styled("Action Hint : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[Enter]: Open Execution Runs Drawer  │  [p]: Pause/Resume  │  [t]: Trigger Now",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]),
+        ];
+
+        let p = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(format!(" Job Details: {} ", job.name))
+                .title_style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
+        frame.render_widget(p, area);
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+        .split(area);
+
+    if app.cron_job_runs.is_empty() {
+        let empty_runs = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("No execution runs recorded for job '{}' yet.", job.name),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Press [t] to trigger an immediate execution run, or [Esc] to close drawer.",
+                Style::default().fg(Color::Yellow),
+            )),
+        ];
+        let p = Paragraph::new(empty_runs)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(format!(" Execution Runs (0) - {} ", job.name))
+                    .title_style(Style::default().fg(Color::Yellow)),
+            )
+            .alignment(ratatui::layout::Alignment::Center);
+        frame.render_widget(p, chunks[0]);
+    } else {
+        let rows: Vec<Row> = app
+            .cron_job_runs
+            .iter()
+            .enumerate()
+            .map(|(idx, run)| {
+                let is_selected = idx == app.selected_cron_run_idx;
+                let row_style = if is_selected {
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+
+                let (badge, badge_style) = match run.status {
+                    cortex_runtime::JobRunStatus::Completed => (
+                        "[DONE]  ",
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    cortex_runtime::JobRunStatus::Running => (
+                        "[RUNNING]",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    cortex_runtime::JobRunStatus::Failed => (
+                        "[FAILED] ",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ),
+                    cortex_runtime::JobRunStatus::Skipped => (
+                        "[SKIP]  ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    cortex_runtime::JobRunStatus::Cancelled => (
+                        "[CANCEL]",
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                };
+
+                let duration_str = run
+                    .duration_ms
+                    .map(|d| {
+                        if d >= 1000 {
+                            format!("{:.1}s", d as f64 / 1000.0)
+                        } else {
+                            format!("{}ms", d)
+                        }
+                    })
+                    .unwrap_or_else(|| "-".to_string());
+
+                let started_str = run.started_at.format("%H:%M:%S").to_string();
+
+                let result_preview = if let Some(err) = &run.error {
+                    format!("Error: {}", err)
+                } else if let Some(out) = &run.output {
+                    out.lines().next().unwrap_or(out).to_string()
+                } else {
+                    "-".to_string()
+                };
+
+                Row::new(vec![
+                    Cell::from(run.id.clone()),
+                    Cell::from(Span::styled(badge, badge_style)),
+                    Cell::from(started_str).style(Style::default().fg(Color::White)),
+                    Cell::from(duration_str).style(Style::default().fg(Color::LightCyan)),
+                    Cell::from(result_preview),
+                ])
+                .style(row_style)
+            })
+            .collect();
+
+        let table = Table::new(
+            rows,
+            [
+                Constraint::Length(22),
+                Constraint::Length(10),
+                Constraint::Length(10),
+                Constraint::Length(9),
+                Constraint::Min(15),
+            ],
+        )
+        .header(
+            Row::new(vec![
+                "Run ID (Correlated)",
+                "Status",
+                "Started",
+                "Duration",
+                "Result Summary",
+            ])
+            .style(
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(format!(
+                    " ◈ Execution Runs ({}) - {} [↑/↓: Select Run] ",
+                    app.cron_job_runs.len(),
+                    job.name
+                ))
+                .title_style(
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+        );
+
+        frame.render_widget(table, chunks[0]);
+    }
+
+    if let Some(run) = app.selected_cron_run() {
+        let (badge, badge_style) = match run.status {
+            cortex_runtime::JobRunStatus::Completed => (
+                "[COMPLETED]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            cortex_runtime::JobRunStatus::Running => (
+                "[RUNNING]",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            cortex_runtime::JobRunStatus::Failed => (
+                "[FAILED]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            cortex_runtime::JobRunStatus::Skipped => (
+                "[SKIPPED]",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            cortex_runtime::JobRunStatus::Cancelled => (
+                "[CANCELLED]",
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        };
+
+        let started_full = run.started_at.format("%Y-%m-%d %H:%M:%S UTC").to_string();
+        let finished_full = run
+            .finished_at
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| "Running / In-Progress".to_string());
+
+        let duration_full = run
+            .duration_ms
+            .map(|d| format!("{} ms ({:.2}s)", d, d as f64 / 1000.0))
+            .unwrap_or_else(|| "-".to_string());
+
+        let mut detail_lines = vec![
+            Line::from(vec![
+                Span::styled("Run ID      : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    &run.id,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Job ID      : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(run.job_id.as_str(), Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(vec![
+                Span::styled("Status      : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(badge, badge_style),
+            ]),
+            Line::from(vec![
+                Span::styled("Started At  : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(started_full, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Finished At : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(finished_full, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("Duration    : ", Style::default().fg(Color::DarkGray)),
+                Span::styled(duration_full, Style::default().fg(Color::LightCyan)),
+            ]),
+            Line::from(""),
+        ];
+
+        if let Some(err) = &run.error {
+            detail_lines.push(Line::from(Span::styled(
+                "Error Trace:",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            )));
+            detail_lines.push(Line::from(Span::styled(
+                err,
+                Style::default().fg(Color::Red),
+            )));
+        } else if let Some(out) = &run.output {
+            detail_lines.push(Line::from(Span::styled(
+                "Execution Output Summary:",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for l in out.lines().take(6) {
+                detail_lines.push(Line::from(Span::styled(
+                    l,
+                    Style::default().fg(Color::Gray),
+                )));
+            }
+        } else {
+            detail_lines.push(Line::from(Span::styled(
+                "No output recorded for this run.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        let p = Paragraph::new(detail_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .title(" Run Inspector ")
+                    .title_style(
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+            )
+            .wrap(Wrap { trim: true });
+
+        frame.render_widget(p, chunks[1]);
+    } else {
+        let p = Paragraph::new("No run selected.").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(" Run Inspector "),
+        );
+        frame.render_widget(p, chunks[1]);
     }
 }
