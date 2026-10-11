@@ -15,6 +15,7 @@ pub mod model;
 pub mod providers;
 pub mod sandbox;
 pub mod scheduler;
+pub mod skill;
 pub mod storage;
 pub mod tool;
 pub mod tools;
@@ -47,6 +48,7 @@ pub use scheduler::{
     CronExpression, CronField, CronJobStats, CronParseError, JobRunRecord, JobRunStatus, JobStatus,
     OverlapPolicy, Schedule, ScheduledJob, SchedulerEngine, TriggerResult,
 };
+pub use skill::{Skill, SkillDiagnostic, SkillLoader, SkillMetadata, SkillRegistry};
 pub use storage::{AgentCheckpointRecord, AgentRecord, RunStore, RunSummary, SecretRedactor};
 pub use tool::{validate_schema, PermissionLevel, Tool, ToolDefinition, ToolRegistry, ToolResult};
 pub use workflow::{
