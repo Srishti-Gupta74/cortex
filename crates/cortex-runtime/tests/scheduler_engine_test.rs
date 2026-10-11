@@ -642,3 +642,88 @@ fn test_timezone_offsets_and_calendar_boundary_transitions() {
         None
     );
 }
+
+#[test]
+fn test_find_job_prefix_and_stats() {
+    let store = Arc::new(RunStore::in_memory().unwrap());
+    let engine = SchedulerEngine::new(store);
+
+    let job = engine
+        .register_job("Prefix Job", "0 12 * * *", "Prompt", OverlapPolicy::Skip)
+        .unwrap();
+
+    let job_id_str = job.id.as_str();
+    let prefix = &job_id_str[..job_id_str.len().min(8)];
+
+    // Exact lookup
+    let found_exact = engine.find_job(job_id_str).unwrap().unwrap();
+    assert_eq!(found_exact.id, job.id);
+
+    // Prefix lookup
+    let found_prefix = engine.find_job(prefix).unwrap().unwrap();
+    assert_eq!(found_prefix.id, job.id);
+
+    // Nonexistent lookup
+    assert_eq!(engine.find_job("nonexistent").unwrap(), None);
+
+    // Empty stats initially
+    let stats = engine.get_job_stats(&job.id).unwrap();
+    assert_eq!(stats.total_runs, 0);
+    assert_eq!(stats.success_runs, 0);
+    assert_eq!(stats.failure_runs, 0);
+
+    // Add runs: 1 completed, 1 failed
+    let now = Utc::now();
+    let res1 = engine.trigger_job(&job.id, now).unwrap();
+    let TriggerResult::Started { run_id, .. } = res1 else {
+        panic!("expected TriggerResult::Started");
+    };
+    engine
+        .finish_job_run(&run_id, &job.id, JobRunStatus::Completed, None, None)
+        .unwrap();
+
+    let res2 = engine.trigger_job(&job.id, now).unwrap();
+    let TriggerResult::Started { run_id, .. } = res2 else {
+        panic!("expected TriggerResult::Started");
+    };
+    engine
+        .finish_job_run(
+            &run_id,
+            &job.id,
+            JobRunStatus::Failed,
+            None,
+            Some("Error message".into()),
+        )
+        .unwrap();
+
+    let updated_stats = engine.get_job_stats(&job.id).unwrap();
+    assert_eq!(updated_stats.total_runs, 2);
+    assert_eq!(updated_stats.success_runs, 1);
+    assert_eq!(updated_stats.failure_runs, 1);
+}
+
+#[test]
+fn test_find_job_ambiguous_prefix() {
+    let store = Arc::new(RunStore::in_memory().unwrap());
+    let engine = SchedulerEngine::new(store);
+
+    let job1 = engine
+        .register_job("Job 1", "0 12 * * *", "Prompt 1", OverlapPolicy::Skip)
+        .unwrap();
+    let job2 = engine
+        .register_job("Job 2", "0 13 * * *", "Prompt 2", OverlapPolicy::Skip)
+        .unwrap();
+
+    assert!(job1.id.as_str().starts_with("job_"));
+    assert!(job2.id.as_str().starts_with("job_"));
+
+    let err = engine.find_job("job_").unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("ambiguous"),
+        "expected error to mention ambiguous prefix, got: {}",
+        err_str
+    );
+    assert!(err_str.contains(job1.id.as_str()));
+    assert!(err_str.contains(job2.id.as_str()));
+}

@@ -361,7 +361,149 @@ fn test_cli_cron_lifecycle() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"name\": \"Nightly Backup\""));
 
-    // 5. Create invalid cron
+    // 5. Inspect job by full ID
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args(["cron", "inspect", job_id, "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute cortex cron inspect");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("Job ID:       {}", job_id)));
+    assert!(stdout.contains("Name:         Nightly Backup"));
+    assert!(stdout.contains("Schedule:     0 2 * * *"));
+    assert!(stdout.contains("Overlap:      queue"));
+    assert!(stdout.contains("Status:       active"));
+    assert!(stdout.contains("Total Runs:   0"));
+    assert!(stdout.contains("Successes:    0"));
+    assert!(stdout.contains("Failures:     0"));
+    assert!(stdout.contains("Prompt:       Backup workspace databases"));
+
+    // 6. Inspect job by prefix
+    let prefix = &job_id[..job_id.len().min(8)];
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args(["cron", "inspect", prefix, "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute cortex cron inspect by prefix");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("Job ID:       {}", job_id)));
+    assert!(stdout.contains("Nightly Backup"));
+
+    // 7. Inspect job JSON
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args([
+            "cron",
+            "inspect",
+            job_id,
+            "--json",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute cortex cron inspect --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(&format!("\"id\": \"{}\"", job_id)));
+    assert!(stdout.contains("\"total_runs\": 0"));
+
+    // 8. History initially empty
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args(["cron", "history", job_id, "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute cortex cron history");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("No execution history found"));
+
+    // 9. History JSON initially empty
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args([
+            "cron",
+            "history",
+            job_id,
+            "--json",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute cortex cron history --json");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "[]");
+
+    // 10. Record a run and check history + stats
+    {
+        let store = cortex_runtime::RunStore::open(&db_path).unwrap();
+        let run_id = "cronrun_test_0001";
+        let now_str = chrono::Utc::now().to_rfc3339();
+        store
+            .record_cron_run_start(run_id, &cortex_core::JobId::from(job_id), &now_str)
+            .unwrap();
+        store
+            .record_cron_run_finish(run_id, "completed", &now_str, Some(150), Some("Done"), None)
+            .unwrap();
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args(["cron", "inspect", job_id, "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute cortex cron inspect after run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Total Runs:   1"));
+    assert!(stdout.contains("Successes:    1"));
+    assert!(stdout.contains("Failures:     0"));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args(["cron", "history", job_id, "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute cortex cron history after run");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("cronrun_test_0001"));
+    assert!(stdout.contains("completed"));
+    assert!(stdout.contains("150ms"));
+
+    // 11. Inspect nonexistent job
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args([
+            "cron",
+            "inspect",
+            "nonexistent_job",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute cortex cron inspect nonexistent");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Cron job 'nonexistent_job' not found"));
+
+    // 12. History nonexistent job
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args([
+            "cron",
+            "history",
+            "nonexistent_job",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute cortex cron history nonexistent");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Cron job 'nonexistent_job' not found"));
+
+    // 13. Create invalid cron
     let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
         .args([
             "cron",
@@ -378,7 +520,7 @@ fn test_cli_cron_lifecycle() {
 
     assert!(!output.status.success());
 
-    // 6. Delete job
+    // 14. Delete job
     let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
         .args(["cron", "delete", job_id, "--db", db_path.to_str().unwrap()])
         .output()
@@ -388,7 +530,7 @@ fn test_cli_cron_lifecycle() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains(&format!("Deleted cron job '{}'", job_id)));
 
-    // 7. Verify empty again
+    // 15. Verify empty again
     let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
         .args(["cron", "list", "--db", db_path.to_str().unwrap()])
         .output()
@@ -397,6 +539,106 @@ fn test_cli_cron_lifecycle() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("No scheduled cron jobs found"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_cli_cron_once_schedule() {
+    let tmp_dir = std::env::temp_dir().join(format!("cortex_cli_cron_once_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let db_path = tmp_dir.join("cortex.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args([
+            "cron",
+            "create",
+            "--name",
+            "Deployment Check",
+            "--schedule",
+            "@once 2026-10-15T15:30:00Z",
+            "--prompt",
+            "Verify canary deployment status",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute cortex cron create");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Created cron job"));
+    assert!(stdout.contains("Deployment Check"));
+
+    let job_id_start = stdout.find('\'').unwrap() + 1;
+    let job_id_end = stdout[job_id_start..].find('\'').unwrap() + job_id_start;
+    let job_id = &stdout[job_id_start..job_id_end];
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args(["cron", "inspect", job_id, "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute cortex cron inspect");
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("Name:         Deployment Check"));
+    assert!(stdout.contains("Schedule:     @once 2026-10-15T15:30:00Z"));
+    assert!(stdout.contains("Prompt:       Verify canary deployment status"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_cli_cron_ambiguous_prefix() {
+    let tmp_dir =
+        std::env::temp_dir().join(format!("cortex_cli_cron_ambig_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let db_path = tmp_dir.join("cortex.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args([
+            "cron",
+            "create",
+            "--name",
+            "Job A",
+            "--schedule",
+            "0 1 * * *",
+            "--prompt",
+            "Task A",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute cortex cron create");
+    assert!(output.status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args([
+            "cron",
+            "create",
+            "--name",
+            "Job B",
+            "--schedule",
+            "0 2 * * *",
+            "--prompt",
+            "Task B",
+            "--db",
+            db_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to execute cortex cron create");
+    assert!(output.status.success());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_cortex"))
+        .args(["cron", "inspect", "job_", "--db", db_path.to_str().unwrap()])
+        .output()
+        .expect("Failed to execute cortex cron inspect");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ambiguous cron job prefix 'job_'"));
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
