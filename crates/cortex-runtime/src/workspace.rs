@@ -63,6 +63,13 @@ impl Workspace {
     pub fn resolve_path(&self, requested: impl AsRef<Path>) -> Result<PathBuf> {
         let requested_path = requested.as_ref();
 
+        // Reject null byte injection attempts
+        if requested_path.as_os_str().to_string_lossy().contains('\0') {
+            return Err(CortexError::Validation(
+                "null-byte injection detected in path".to_string(),
+            ));
+        }
+
         // Prevent obvious directory traversal tokens in relative paths
         for component in requested_path.components() {
             if component == Component::ParentDir {

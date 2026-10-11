@@ -98,10 +98,14 @@ fn execute_shell_command(
 
     // Scrub sensitive host environment variables
     cmd.env_remove("AWS_SECRET_ACCESS_KEY");
+    cmd.env_remove("AWS_SESSION_TOKEN");
     cmd.env_remove("OPENAI_API_KEY");
     cmd.env_remove("ANTHROPIC_API_KEY");
     cmd.env_remove("GITHUB_TOKEN");
     cmd.env_remove("GH_TOKEN");
+    cmd.env_remove("SSH_AUTH_SOCK");
+    cmd.env_remove("SSH_AGENT_PID");
+    cmd.env_remove("CORTEX_API_KEY");
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());

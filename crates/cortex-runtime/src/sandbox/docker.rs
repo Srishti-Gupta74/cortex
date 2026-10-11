@@ -104,6 +104,12 @@ impl DockerSandbox {
 
         // Determine target working directory inside container
         let container_workdir = if let Some(sub_dir) = working_dir {
+            if sub_dir.as_os_str().to_string_lossy().contains('\0') {
+                return Err(CortexError::Validation(
+                    "null-byte injection detected in working directory".to_string(),
+                ));
+            }
+
             let target = if sub_dir.is_absolute() {
                 sub_dir.to_path_buf()
             } else {

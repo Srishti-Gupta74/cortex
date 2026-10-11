@@ -59,7 +59,7 @@ fn cancels_orphaned_output_pipes() {
         "{result:?}"
     );
     assert!(start.elapsed() < Duration::from_secs(2));
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[test]
@@ -74,5 +74,5 @@ fn precancelled_shell_does_not_spawn() {
     );
     assert!(matches!(result, Err(CortexError::Cancelled(_))));
     assert!(!root.join("marker").exists());
-    std::fs::remove_dir_all(root).unwrap();
+    let _ = std::fs::remove_dir_all(root);
 }

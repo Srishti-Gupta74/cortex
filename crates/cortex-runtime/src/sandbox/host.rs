@@ -27,6 +27,12 @@ impl HostSandbox {
 
     /// Validate that a requested target directory is strictly contained within the workspace root.
     pub fn validate_path(&self, target: &Path) -> Result<PathBuf> {
+        if target.as_os_str().to_string_lossy().contains('\0') {
+            return Err(CortexError::Validation(
+                "null-byte injection detected in path".to_string(),
+            ));
+        }
+
         let canonical_root = self
             .workspace_root
             .canonicalize()
@@ -100,6 +106,17 @@ impl Sandbox for HostSandbox {
         cmd.args(["-c", command]);
 
         cmd.current_dir(target_dir);
+
+        // Scrub sensitive credentials and host tokens from sandboxed execution
+        cmd.env_remove("AWS_SECRET_ACCESS_KEY");
+        cmd.env_remove("AWS_SESSION_TOKEN");
+        cmd.env_remove("OPENAI_API_KEY");
+        cmd.env_remove("ANTHROPIC_API_KEY");
+        cmd.env_remove("GITHUB_TOKEN");
+        cmd.env_remove("GH_TOKEN");
+        cmd.env_remove("SSH_AUTH_SOCK");
+        cmd.env_remove("SSH_AGENT_PID");
+        cmd.env_remove("CORTEX_API_KEY");
 
         let output = cmd.output().map_err(|e| {
             CortexError::Internal(format!("failed to execute command on host: {e}"))
