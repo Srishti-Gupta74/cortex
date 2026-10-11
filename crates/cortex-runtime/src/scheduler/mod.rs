@@ -8,7 +8,7 @@ pub mod cron;
 pub use cron::{CronExpression, CronField, CronParseError, Schedule};
 
 use chrono::{DateTime, Utc};
-use cortex_core::{CortexError, JobId, Result};
+use cortex_core::{AgentId, CortexError, JobId, Result, RunId};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -16,7 +16,13 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::agent::{
+    AgentContext, AgentLoop, AgentManager, CancellationToken, ChatMessage, PermissionState,
+};
+use crate::model::ModelProvider;
 use crate::storage::RunStore;
+use crate::tool::ToolRegistry;
+use crate::workspace::Workspace;
 
 /// Execution overlap policy when a scheduled trigger fires while a previous run is still active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -186,6 +192,16 @@ pub struct ScheduledJob {
     pub created_at: DateTime<Utc>,
     /// Last updated timestamp.
     pub updated_at: DateTime<Utc>,
+    /// Optional target agent identifier to execute when triggered.
+    pub agent_id: Option<AgentId>,
+}
+
+impl ScheduledJob {
+    /// Attach a target agent identifier to this scheduled job.
+    pub fn with_agent_id(mut self, agent_id: AgentId) -> Self {
+        self.agent_id = Some(agent_id);
+        self
+    }
 }
 
 /// Recorded history of a single scheduled job execution.
@@ -195,6 +211,8 @@ pub struct JobRunRecord {
     pub id: String,
     /// Associated scheduled job identifier.
     pub job_id: JobId,
+    /// Associated execution run identifier in `runs` table, if executed via [`AgentLoop`].
+    pub run_id: Option<RunId>,
     /// Run execution status.
     pub status: JobRunStatus,
     /// Start timestamp.
@@ -254,6 +272,10 @@ fn generate_cron_run_id() -> String {
 pub struct SchedulerEngine {
     store: Arc<RunStore>,
     queued_triggers: Mutex<HashMap<JobId, usize>>,
+    agent_manager: std::sync::RwLock<Option<Arc<AgentManager>>>,
+    model_provider: std::sync::RwLock<Option<Arc<dyn ModelProvider>>>,
+    tool_registry: std::sync::RwLock<Option<Arc<ToolRegistry>>>,
+    active_tokens: Mutex<HashMap<String, CancellationToken>>,
 }
 
 impl SchedulerEngine {
@@ -262,16 +284,54 @@ impl SchedulerEngine {
         Self {
             store,
             queued_triggers: Mutex::new(HashMap::new()),
+            agent_manager: std::sync::RwLock::new(None),
+            model_provider: std::sync::RwLock::new(None),
+            tool_registry: std::sync::RwLock::new(None),
+            active_tokens: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Register and persist a new scheduled job.
-    pub fn register_job(
+    /// Attach an [`AgentManager`] for resolving target agent definitions and policies.
+    pub fn with_agent_manager(self, manager: Arc<AgentManager>) -> Self {
+        *self.agent_manager.write().unwrap() = Some(manager);
+        self
+    }
+
+    /// Set an [`AgentManager`].
+    pub fn set_agent_manager(&self, manager: Arc<AgentManager>) {
+        *self.agent_manager.write().unwrap() = Some(manager);
+    }
+
+    /// Attach a [`ModelProvider`] for powering agent inference during scheduled execution.
+    pub fn with_model_provider(self, provider: Arc<dyn ModelProvider>) -> Self {
+        *self.model_provider.write().unwrap() = Some(provider);
+        self
+    }
+
+    /// Set a [`ModelProvider`].
+    pub fn set_model_provider(&self, provider: Arc<dyn ModelProvider>) {
+        *self.model_provider.write().unwrap() = Some(provider);
+    }
+
+    /// Attach a [`ToolRegistry`] providing tool capabilities during scheduled execution.
+    pub fn with_tool_registry(self, registry: Arc<ToolRegistry>) -> Self {
+        *self.tool_registry.write().unwrap() = Some(registry);
+        self
+    }
+
+    /// Set a [`ToolRegistry`].
+    pub fn set_tool_registry(&self, registry: Arc<ToolRegistry>) {
+        *self.tool_registry.write().unwrap() = Some(registry);
+    }
+
+    /// Register and persist a new scheduled job with optional target agent.
+    pub fn register_job_with_agent(
         &self,
         name: impl Into<String>,
         schedule_str: &str,
         prompt: impl Into<String>,
         overlap_policy: OverlapPolicy,
+        agent_id: Option<AgentId>,
     ) -> Result<ScheduledJob> {
         let name = name.into();
         let prompt = prompt.into();
@@ -295,10 +355,22 @@ impl SchedulerEngine {
             last_run_at: None,
             created_at: now,
             updated_at: now,
+            agent_id,
         };
 
         self.store.save_cron_job(&job)?;
         Ok(job)
+    }
+
+    /// Register and persist a new scheduled job.
+    pub fn register_job(
+        &self,
+        name: impl Into<String>,
+        schedule_str: &str,
+        prompt: impl Into<String>,
+        overlap_policy: OverlapPolicy,
+    ) -> Result<ScheduledJob> {
+        self.register_job_with_agent(name, schedule_str, prompt, overlap_policy, None)
     }
 
     /// Retrieve a registered job by its identifier.
@@ -389,7 +461,7 @@ impl SchedulerEngine {
                     let now_str = now.to_rfc3339();
 
                     self.store
-                        .record_cron_run_start(&skip_run_id, id, &now_str)?;
+                        .record_cron_run_start(&skip_run_id, id, &now_str, None)?;
                     self.store.record_cron_run_finish(
                         &skip_run_id,
                         JobRunStatus::Skipped.as_str(),
@@ -442,7 +514,7 @@ impl SchedulerEngine {
                     // Start new run immediately
                     let new_run_id = generate_cron_run_id();
                     self.store
-                        .record_cron_run_start(&new_run_id, id, &now_str)?;
+                        .record_cron_run_start(&new_run_id, id, &now_str, None)?;
 
                     let next = sched.next_run_after(&now);
                     let next_status = if sched.is_one_shot() && next.is_none() {
@@ -471,7 +543,8 @@ impl SchedulerEngine {
         // No active run: start execution normally
         let run_id = generate_cron_run_id();
         let now_str = now.to_rfc3339();
-        self.store.record_cron_run_start(&run_id, id, &now_str)?;
+        self.store
+            .record_cron_run_start(&run_id, id, &now_str, None)?;
 
         let next = sched.next_run_after(&now);
         let next_status = if sched.is_one_shot() && next.is_none() {
@@ -492,6 +565,264 @@ impl SchedulerEngine {
             run_id,
             job_id: id.clone(),
         })
+    }
+
+    /// Dispatch a scheduled job through [`AgentLoop`], creating execution runs,
+    /// resolving target agents, and recording full structured execution traces in SQLite.
+    pub fn dispatch_job(&self, id: &JobId, now: DateTime<Utc>) -> Result<TriggerResult> {
+        let job = self
+            .store
+            .get_cron_job(id)?
+            .ok_or_else(|| CortexError::NotFound(format!("scheduled job '{}'", id)))?;
+
+        let sched = Schedule::parse(&job.schedule)
+            .map_err(|e| CortexError::Validation(format!("invalid schedule: {}", e)))?;
+
+        let active_run = self.store.get_active_cron_run(id)?;
+        let mut replaced_run_id: Option<String> = None;
+
+        if let Some(running) = active_run {
+            match job.overlap_policy {
+                OverlapPolicy::Skip => {
+                    let next = sched.next_run_after(&now);
+                    let skip_run_id = generate_cron_run_id();
+                    let now_str = now.to_rfc3339();
+
+                    self.store
+                        .record_cron_run_start(&skip_run_id, id, &now_str, None)?;
+                    self.store.record_cron_run_finish(
+                        &skip_run_id,
+                        JobRunStatus::Skipped.as_str(),
+                        &now_str,
+                        Some(0),
+                        None,
+                        Some("Execution skipped: previous run is still active"),
+                    )?;
+
+                    let next_str = next.as_ref().map(|dt| dt.to_rfc3339());
+                    self.store.update_cron_job_schedule(
+                        id,
+                        next_str.as_deref(),
+                        Some(&job.last_run_at.unwrap_or(now).to_rfc3339()),
+                        job.status.as_str(),
+                    )?;
+
+                    return Ok(TriggerResult::Skipped {
+                        job_id: id.clone(),
+                        reason: "Active run in progress".to_string(),
+                    });
+                }
+                OverlapPolicy::Queue => {
+                    let mut queued = self.queued_triggers.lock().unwrap();
+                    let count = queued.entry(id.clone()).or_insert(0);
+                    *count += 1;
+
+                    let next = sched.next_run_after(&now);
+                    let next_str = next.as_ref().map(|dt| dt.to_rfc3339());
+                    self.store.update_cron_job_schedule(
+                        id,
+                        next_str.as_deref(),
+                        Some(&job.last_run_at.unwrap_or(now).to_rfc3339()),
+                        job.status.as_str(),
+                    )?;
+
+                    return Ok(TriggerResult::Queued { job_id: id.clone() });
+                }
+                OverlapPolicy::Replace => {
+                    let now_str = now.to_rfc3339();
+                    {
+                        let mut tokens = self.active_tokens.lock().unwrap();
+                        if let Some(token) = tokens.remove(&running.id) {
+                            token.cancel();
+                        }
+                    }
+                    self.store.cancel_cron_run(
+                        &running.id,
+                        &now_str,
+                        "Replaced by newer scheduled execution",
+                    )?;
+                    replaced_run_id = Some(running.id);
+                }
+            }
+        }
+
+        let model = self.model_provider.read().unwrap().clone().ok_or_else(|| {
+            CortexError::Internal(
+                "no model provider configured for scheduler execution".to_string(),
+            )
+        })?;
+
+        let cron_run_id = generate_cron_run_id();
+        let execution_run_id = RunId::generate();
+        let now_str = now.to_rfc3339();
+
+        // Target Agent Resolution:
+        // 1. If job has an agent_id, resolve via AgentManager.
+        // 2. If not found or unset, fallback to first registered agent in AgentManager.
+        // 3. Otherwise use default coding agent policy.
+        let target_agent = if let Some(ref aid) = job.agent_id {
+            if let Some(ref am) = *self.agent_manager.read().unwrap() {
+                am.inspect(aid).ok()
+            } else {
+                None
+            }
+        } else if let Some(ref am) = *self.agent_manager.read().unwrap() {
+            am.list().into_iter().next()
+        } else {
+            None
+        };
+
+        // Initialize AgentContext with workspace, permissions, and tool definitions
+        let mut context = AgentContext::new(&job.prompt).with_run_id(execution_run_id.clone());
+        if let Some(ref agent) = target_agent {
+            if let Some(ref sys_prompt) = agent.system_prompt {
+                if !context.messages.is_empty() {
+                    context.messages[0] = ChatMessage::System(sys_prompt.clone());
+                }
+            }
+            if agent.workspace.exists() {
+                if let Ok(ws) = Workspace::new(&agent.workspace) {
+                    context = context.with_workspace(Arc::new(ws));
+                }
+            }
+        }
+        context = context.with_permission_state(PermissionState::AutoAccept);
+
+        // Tool registry resolution
+        let tools = if let Some(ref tr) = *self.tool_registry.read().unwrap() {
+            Arc::clone(tr)
+        } else {
+            let tr = Arc::new(ToolRegistry::new());
+            if let Some(ref ws) = context.workspace {
+                let _ = crate::tools::register_standard_tools(&tr, Arc::clone(ws));
+            }
+            tr
+        };
+
+        // Register cancellation token
+        let cancel_token = CancellationToken::new();
+        self.active_tokens
+            .lock()
+            .unwrap()
+            .insert(cron_run_id.clone(), cancel_token.clone());
+
+        // Record start in cron_job_runs linked to execution_run_id
+        self.store
+            .record_cron_run_start(&cron_run_id, id, &now_str, Some(&execution_run_id))?;
+
+        let next = sched.next_run_after(&now);
+        let next_status = if sched.is_one_shot() && next.is_none() {
+            JobStatus::Completed
+        } else {
+            job.status
+        };
+
+        let next_str = next.as_ref().map(|dt| dt.to_rfc3339());
+        self.store.update_cron_job_schedule(
+            id,
+            next_str.as_deref(),
+            Some(&now_str),
+            next_status.as_str(),
+        )?;
+
+        // Execute via AgentLoop with store event tracing and cancellation token
+        let agent_loop = AgentLoop::new(10)
+            .with_cancellation_token(cancel_token)
+            .with_store(Arc::clone(&self.store));
+
+        let loop_result = agent_loop.run(&mut context, model.as_ref(), &tools);
+
+        // Remove active token
+        self.active_tokens.lock().unwrap().remove(&cron_run_id);
+
+        let finished_at = Utc::now().to_rfc3339();
+        match &loop_result {
+            Ok(run_result) => {
+                let status = if run_result.completed {
+                    JobRunStatus::Completed
+                } else {
+                    JobRunStatus::Failed
+                };
+                self.store.record_cron_run_finish(
+                    &cron_run_id,
+                    status.as_str(),
+                    &finished_at,
+                    Some(run_result.duration_ms),
+                    Some(&run_result.final_answer),
+                    None,
+                )?;
+            }
+            Err(CortexError::Cancelled(reason)) => {
+                self.store.record_cron_run_finish(
+                    &cron_run_id,
+                    JobRunStatus::Cancelled.as_str(),
+                    &finished_at,
+                    None,
+                    None,
+                    Some(reason),
+                )?;
+            }
+            Err(e) => {
+                self.store.record_cron_run_finish(
+                    &cron_run_id,
+                    JobRunStatus::Failed.as_str(),
+                    &finished_at,
+                    None,
+                    None,
+                    Some(&e.to_string()),
+                )?;
+            }
+        }
+
+        // Process queued triggers if any
+        let has_queued = {
+            let mut queued = self.queued_triggers.lock().unwrap();
+            if let Some(count) = queued.get_mut(id) {
+                if *count > 0 {
+                    *count -= 1;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if has_queued {
+            let _ = self.dispatch_job(id, Utc::now());
+        }
+
+        if let Some(cancelled_run_id) = replaced_run_id {
+            Ok(TriggerResult::Replaced {
+                cancelled_run_id,
+                new_run_id: cron_run_id,
+                job_id: id.clone(),
+            })
+        } else {
+            Ok(TriggerResult::Started {
+                run_id: cron_run_id,
+                job_id: id.clone(),
+            })
+        }
+    }
+
+    /// Cancel any currently executing run for the specified job.
+    pub fn cancel_active_job(&self, job_id: &JobId) -> Result<bool> {
+        if let Some(running) = self.store.get_active_cron_run(job_id)? {
+            let now_str = Utc::now().to_rfc3339();
+            {
+                let mut tokens = self.active_tokens.lock().unwrap();
+                if let Some(token) = tokens.remove(&running.id) {
+                    token.cancel();
+                }
+            }
+            self.store
+                .cancel_cron_run(&running.id, &now_str, "Cancelled by user request")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Complete an active run, and if triggers were queued for this job, start the queued execution.
@@ -533,12 +864,17 @@ impl SchedulerEngine {
     pub fn tick(&self, now: DateTime<Utc>) -> Result<Vec<TriggerResult>> {
         let jobs = self.store.list_cron_jobs()?;
         let mut results = Vec::new();
+        let has_model = self.model_provider.read().unwrap().is_some();
 
         for job in jobs {
             if job.status == JobStatus::Active {
                 if let Some(next_run) = job.next_run_at {
                     if next_run <= now {
-                        let res = self.trigger_job(&job.id, now)?;
+                        let res = if has_model {
+                            self.dispatch_job(&job.id, now)?
+                        } else {
+                            self.trigger_job(&job.id, now)?
+                        };
                         results.push(res);
                     }
                 }
