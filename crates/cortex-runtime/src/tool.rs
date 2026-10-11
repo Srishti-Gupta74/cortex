@@ -1,5 +1,6 @@
 //! Tool trait, definition contracts, schema validation, and tool registry.
 
+use crate::agent::manager::AgentPermissions;
 use crate::agent::CancellationToken;
 use cortex_core::{CortexError, Result};
 use serde::{Deserialize, Serialize};
@@ -234,10 +235,11 @@ pub fn validate_schema(schema: &serde_json::Value, input: &serde_json::Value) ->
 
 /// Thread-safe registry for agent tools.
 ///
-/// Manages tool registration, lookup, enumeration, and schema-validated execution.
+/// Manages tool registration, lookup, enumeration, capability authorization, and schema-validated execution.
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
+    permissions: RwLock<Option<AgentPermissions>>,
 }
 
 impl ToolRegistry {
@@ -245,7 +247,28 @@ impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: RwLock::new(HashMap::new()),
+            permissions: RwLock::new(None),
         }
+    }
+
+    /// Attach capability permissions to this tool registry.
+    pub fn with_permissions(self, permissions: AgentPermissions) -> Self {
+        if let Ok(mut p) = self.permissions.write() {
+            *p = Some(permissions);
+        }
+        self
+    }
+
+    /// Update runtime capability permissions for this registry.
+    pub fn set_permissions(&self, permissions: Option<AgentPermissions>) {
+        if let Ok(mut p) = self.permissions.write() {
+            *p = permissions;
+        }
+    }
+
+    /// Retrieve the currently configured capability permissions.
+    pub fn permissions(&self) -> Option<AgentPermissions> {
+        self.permissions.read().ok().and_then(|p| p.clone())
     }
 
     /// Register a tool instance wrapped in an [`Arc`].
@@ -303,18 +326,34 @@ impl ToolRegistry {
     ///
     /// Returns [`CortexError::NotFound`] if the tool is not registered.
     /// Returns [`CortexError::Validation`] if argument schema validation fails.
+    /// Returns [`CortexError::PermissionDenied`] if capability boundaries are violated.
     pub fn execute(&self, name: &str, input: &serde_json::Value) -> Result<ToolResult> {
-        self.execute_with_cancellation(name, input, None)
+        self.execute_with_permissions(name, input, None, None)
     }
 
     /// Validate input arguments and execute the specified tool with an optional cooperative cancellation token.
     ///
     /// Returns [`CortexError::NotFound`] if the tool is not registered.
     /// Returns [`CortexError::Validation`] if argument schema validation fails.
+    /// Returns [`CortexError::PermissionDenied`] if capability boundaries are violated.
     pub fn execute_with_cancellation(
         &self,
         name: &str,
         input: &serde_json::Value,
+        cancellation_token: Option<&CancellationToken>,
+    ) -> Result<ToolResult> {
+        self.execute_with_permissions(name, input, None, cancellation_token)
+    }
+
+    /// Validate capability permissions, input schema, and execute the specified tool.
+    ///
+    /// Enforces capability boundaries (`AgentPermissions`) prior to tool execution.
+    /// Returns [`CortexError::PermissionDenied`] if unpermitted capability operations are attempted.
+    pub fn execute_with_permissions(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        permissions: Option<&AgentPermissions>,
         cancellation_token: Option<&CancellationToken>,
     ) -> Result<ToolResult> {
         if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
@@ -331,6 +370,13 @@ impl ToolRegistry {
                 "tool '{}' is not available in current environment",
                 name
             )));
+        }
+
+        // Enforce capability permissions if present
+        let configured = self.permissions();
+        let active_perms = permissions.or(configured.as_ref());
+        if let Some(perms) = active_perms {
+            perms.validate_tool_call(name, input, tool.permission_level())?;
         }
 
         // Validate arguments against tool parameters schema
@@ -535,5 +581,45 @@ mod tests {
         }
 
         assert_eq!(success_count.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn test_tool_registry_permissions_enforcement() {
+        let registry = ToolRegistry::new().with_permissions(AgentPermissions::read_only());
+        registry.register_tool(EchoTool::new()).unwrap();
+
+        let mut dangerous_def = ToolDefinition::new("rm_tool", "dangerous deletion", json!({}));
+        dangerous_def.permission_level = PermissionLevel::WorkspaceWrite;
+
+        struct DeleteTool {
+            def: ToolDefinition,
+        }
+        impl Tool for DeleteTool {
+            fn definition(&self) -> &ToolDefinition {
+                &self.def
+            }
+            fn execute(&self, _input: &serde_json::Value) -> Result<ToolResult> {
+                Ok(ToolResult::success("deleted"))
+            }
+        }
+
+        registry
+            .register_tool(DeleteTool { def: dangerous_def })
+            .unwrap();
+
+        // Echo is ReadOnly and permitted
+        let res = registry
+            .execute("echo", &json!({ "message": "hello" }))
+            .unwrap();
+        assert_eq!(res.output, "hello");
+
+        // rm_tool is WorkspaceWrite, but permissions are read_only => PermissionDenied!
+        let err = registry.execute("rm_tool", &json!({})).unwrap_err();
+        match err {
+            CortexError::PermissionDenied(msg) => {
+                assert!(msg.contains("workspace write operations are not permitted"));
+            }
+            other => panic!("expected PermissionDenied, got {:?}", other),
+        }
     }
 }

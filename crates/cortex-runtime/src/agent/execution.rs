@@ -107,6 +107,8 @@ pub struct AgentContext {
     pub todos: Vec<TodoItem>,
     /// Active permission mode for tool authorization.
     pub permission_state: PermissionState,
+    /// Configured capability permissions boundary.
+    pub permissions: Option<super::manager::AgentPermissions>,
     /// Session metadata and telemetry.
     pub session_metadata: SessionMetadata,
     /// Optional cancellation token for cooperative cancellation.
@@ -131,6 +133,7 @@ impl AgentContext {
             modified_files: Vec::new(),
             todos: Vec::new(),
             permission_state: PermissionState::default(),
+            permissions: None,
             session_metadata: SessionMetadata::default(),
             cancellation_token: None,
         }
@@ -158,6 +161,12 @@ impl AgentContext {
     /// Set the permission state for this context.
     pub fn with_permission_state(mut self, state: PermissionState) -> Self {
         self.permission_state = state;
+        self
+    }
+
+    /// Attach capability permissions to this execution context.
+    pub fn with_permissions(mut self, permissions: super::manager::AgentPermissions) -> Self {
+        self.permissions = Some(permissions);
         self
     }
 
@@ -268,6 +277,7 @@ pub struct AgentLoop {
     token_callback: Option<TokenCallback>,
     tool_start_callback: Option<ToolStartCallback>,
     tool_end_callback: Option<ToolEndCallback>,
+    permissions: Option<super::manager::AgentPermissions>,
 }
 
 impl AgentLoop {
@@ -281,6 +291,7 @@ impl AgentLoop {
             token_callback: None,
             tool_start_callback: None,
             tool_end_callback: None,
+            permissions: None,
         }
     }
 
@@ -322,6 +333,12 @@ impl AgentLoop {
     ) -> Self {
         self.tool_start_callback = Some(start_cb);
         self.tool_end_callback = Some(end_cb);
+        self
+    }
+
+    /// Attach explicit capability permissions to this agent execution loop.
+    pub fn with_permissions(mut self, permissions: super::manager::AgentPermissions) -> Self {
+        self.permissions = Some(permissions);
         self
     }
 
@@ -578,10 +595,13 @@ impl AgentLoop {
                             cb(&call.name, &args_str);
                         }
 
-                        // Execute tool through registry (validates schema before dispatch)
-                        let tool_result = registry.execute_with_cancellation(
+                        // Execute tool through registry with capability permissions validation
+                        let active_perms =
+                            self.permissions.as_ref().or(context.permissions.as_ref());
+                        let tool_result = registry.execute_with_permissions(
                             &call.name,
                             &call.arguments,
+                            active_perms,
                             Some(&self.cancellation_token),
                         );
 
@@ -875,5 +895,66 @@ mod tests {
         }
 
         assert!(received_tokens.load(Ordering::SeqCst) < 10);
+    }
+
+    #[test]
+    fn test_agent_loop_enforces_permissions_and_records_tool_failed() {
+        let store = Arc::new(RunStore::in_memory().unwrap());
+        let permissions = crate::agent::manager::AgentPermissions::read_only();
+        let mut context = AgentContext::new("attempt write").with_permissions(permissions);
+        let model = MockModelProvider::new();
+        let registry = ToolRegistry::new();
+
+        struct MutatingTool {
+            def: ToolDefinition,
+        }
+        impl Tool for MutatingTool {
+            fn definition(&self) -> &ToolDefinition {
+                &self.def
+            }
+            fn execute(&self, _input: &serde_json::Value) -> Result<ToolResult> {
+                Ok(ToolResult::success("mutated workspace"))
+            }
+        }
+
+        registry
+            .register_tool(MutatingTool {
+                def: ToolDefinition::new("write_file", "writes file", json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" }, "content": { "type": "string" } }
+                }))
+                .with_permission(crate::tool::PermissionLevel::WorkspaceWrite),
+            })
+            .unwrap();
+
+        // Model attempts to call write_file (disallowed under read_only permissions)
+        model.queue_response(ModelOutput::ToolCalls(vec![ToolCall::new(
+            "call_disallowed_1",
+            "write_file",
+            json!({ "path": "test.txt", "content": "malicious edit" }),
+        )]));
+        model.queue_response(ModelOutput::FinalAnswer(
+            "stopped due to permission denial".to_string(),
+        ));
+
+        let agent_loop = AgentLoop::new(5).with_store(Arc::clone(&store));
+        let res = agent_loop.run(&mut context, &model, &registry).unwrap();
+        assert!(res.completed);
+
+        // Verify stored events: should have ToolFailed recorded for write_file
+        let events = store.get_events(&res.run_id).unwrap();
+        let failed_event = events
+            .iter()
+            .find(|record| matches!(&record.event, ExecutionEvent::ToolFailed { tool_name, .. } if tool_name == "write_file"));
+        assert!(
+            failed_event.is_some(),
+            "ExecutionEvent::ToolFailed must be recorded in RunStore"
+        );
+
+        if let ExecutionEvent::ToolFailed { error, .. } = &failed_event.unwrap().event {
+            assert!(error.to_lowercase().contains("permission denied"));
+        } else {
+            panic!("expected ToolFailed event");
+        }
     }
 }
