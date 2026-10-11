@@ -18,6 +18,8 @@ pub enum YamlPermissionValue {
     String(String),
     /// Explicit list of allowed operations or patterns.
     List(Vec<String>),
+    /// Key-value map of capability options (e.g., `git: { read: true, push: false }`).
+    Map(std::collections::HashMap<String, YamlPermissionValue>),
 }
 
 /// Declarative permissions block for `agent.yaml`.
@@ -32,6 +34,9 @@ pub struct AgentYamlPermissions {
     /// Git push authorization flag.
     #[serde(default)]
     pub git_push: Option<bool>,
+    /// Git capability permission (e.g., boolean, list, or map `{ read: true, push: false }`).
+    #[serde(default)]
+    pub git: Option<YamlPermissionValue>,
     /// Network destination permission.
     #[serde(default)]
     pub network: Option<YamlPermissionValue>,
@@ -46,7 +51,7 @@ impl AgentYamlPermissions {
             }
             Some(YamlPermissionValue::Boolean(false)) => Vec::new(),
             Some(YamlPermissionValue::String(s)) => {
-                if s == "workspace_only" {
+                if s == "workspace_only" || s == "workspace" {
                     vec![
                         "workspace_only".to_string(),
                         "read".to_string(),
@@ -59,29 +64,98 @@ impl AgentYamlPermissions {
                 }
             }
             Some(YamlPermissionValue::List(list)) => list.clone(),
+            Some(YamlPermissionValue::Map(map)) => {
+                let mut ops = Vec::new();
+                for (k, v) in map {
+                    let enabled = match v {
+                        YamlPermissionValue::Boolean(b) => *b,
+                        YamlPermissionValue::String(s) => s != "false" && s != "deny",
+                        _ => true,
+                    };
+                    if enabled {
+                        ops.push(k.clone());
+                    }
+                }
+                ops
+            }
             None => vec!["read".to_string(), "write".to_string()],
         };
 
         let shell = match &self.shell {
             Some(YamlPermissionValue::Boolean(true)) => vec!["*".to_string()],
             Some(YamlPermissionValue::Boolean(false)) => Vec::new(),
-            Some(YamlPermissionValue::String(s)) => vec![s.clone()],
+            Some(YamlPermissionValue::String(s)) => {
+                if s == "none" || s == "false" || s == "deny" {
+                    Vec::new()
+                } else {
+                    vec![s.clone()]
+                }
+            }
             Some(YamlPermissionValue::List(list)) => list.clone(),
+            Some(YamlPermissionValue::Map(_)) => Vec::new(),
             None => Vec::new(),
         };
 
         let network = match &self.network {
             Some(YamlPermissionValue::Boolean(true)) => vec!["allow".to_string()],
             Some(YamlPermissionValue::Boolean(false)) => Vec::new(),
-            Some(YamlPermissionValue::String(s)) => vec![s.clone()],
+            Some(YamlPermissionValue::String(s)) => {
+                if s == "none" || s == "false" || s == "deny" {
+                    Vec::new()
+                } else {
+                    vec![s.clone()]
+                }
+            }
             Some(YamlPermissionValue::List(list)) => list.clone(),
+            Some(YamlPermissionValue::Map(_)) => Vec::new(),
             None => Vec::new(),
         };
+
+        let mut git = match &self.git {
+            Some(YamlPermissionValue::Boolean(true)) => {
+                vec!["read".to_string(), "commit".to_string()]
+            }
+            Some(YamlPermissionValue::Boolean(false)) => Vec::new(),
+            Some(YamlPermissionValue::String(s)) => {
+                if s == "read_only" {
+                    vec!["read".to_string()]
+                } else if s == "none" || s == "false" || s == "deny" {
+                    Vec::new()
+                } else {
+                    vec![s.clone()]
+                }
+            }
+            Some(YamlPermissionValue::List(list)) => list.clone(),
+            Some(YamlPermissionValue::Map(map)) => {
+                let mut ops = Vec::new();
+                for (k, v) in map {
+                    let enabled = match v {
+                        YamlPermissionValue::Boolean(b) => *b,
+                        YamlPermissionValue::String(s) => s != "false" && s != "deny",
+                        _ => true,
+                    };
+                    if enabled {
+                        ops.push(k.clone());
+                    }
+                }
+                ops
+            }
+            None => vec!["read".to_string(), "commit".to_string()],
+        };
+
+        if let Some(false) = self.git_push {
+            git.retain(|op| op != "push" && op != "*");
+        } else if let Some(true) = self.git_push {
+            if !git.contains(&"push".to_string()) {
+                git.push("push".to_string());
+            }
+        }
 
         AgentPermissions {
             filesystem,
             network,
             shell,
+            git,
         }
     }
 }
@@ -271,15 +345,16 @@ impl AgentYamlManifest {
             manifest = manifest.with_system_prompt(prompt);
         }
 
+        let runtime_perms = self.permissions.to_runtime_permissions();
         let mut tools = self.tools;
-        // If git_push is explicitly forbidden in permissions, strip git_push from tools
-        if let Some(false) = self.permissions.git_push {
+        // If git_push is not permitted by capability permissions, strip git_push from tools
+        if !runtime_perms.allows_git("push") {
             tools.retain(|t| t != "git_push");
         }
 
         manifest = manifest
             .with_tools(tools)
-            .with_permissions(self.permissions.to_runtime_permissions())
+            .with_permissions(runtime_perms)
             .with_auto_resume(self.auto_resume);
 
         Ok(manifest)
@@ -289,5 +364,39 @@ impl AgentYamlManifest {
     pub fn to_yaml_string(&self) -> Result<String> {
         serde_yaml::to_string(self)
             .map_err(|e| CortexError::Internal(format!("failed to serialize YAML manifest: {}", e)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_yaml_permissions_parsing_map_and_booleans() {
+        let yaml = r#"
+name: test_agent
+role: Tester
+workspace: /tmp
+model: mock-gpt
+permissions:
+  filesystem: workspace
+  shell: false
+  network: false
+  git:
+    read: true
+    commit: true
+    push: false
+"#;
+        let manifest = AgentYamlManifest::from_yaml_str(yaml).unwrap();
+        let runtime_manifest = manifest.into_manifest().unwrap();
+        let perms = runtime_manifest.permissions;
+
+        assert!(perms.allows_filesystem_read());
+        assert!(perms.allows_filesystem_write());
+        assert!(!perms.allows_shell(Some("cargo test")));
+        assert!(!perms.allows_network(None));
+        assert!(perms.allows_git("read"));
+        assert!(perms.allows_git("commit"));
+        assert!(!perms.allows_git("push"));
     }
 }

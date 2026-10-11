@@ -60,24 +60,28 @@ impl AgentModelConfig {
 /// Operational permission boundaries for an agent.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct AgentPermissions {
-    /// Allowed filesystem operations (e.g. `["read", "write"]`).
+    /// Allowed filesystem operations (e.g. `["read", "write"]`, `["read"]`, `["workspace_only"]`).
     #[serde(default)]
     pub filesystem: Vec<String>,
-    /// Allowed network destinations or hosts.
+    /// Allowed network destinations or hosts (e.g. `["allow"]`, `[]`, or hostnames).
     #[serde(default)]
     pub network: Vec<String>,
-    /// Allowed shell commands or command patterns.
+    /// Allowed shell commands or command patterns (e.g. `["*"]`, `["cargo", "git"]`, `[]`).
     #[serde(default)]
     pub shell: Vec<String>,
+    /// Allowed git operations (e.g. `["read", "commit"]`, `["read"]`, `["push"]`).
+    #[serde(default)]
+    pub git: Vec<String>,
 }
 
 impl AgentPermissions {
-    /// Create full permissions with read/write filesystem and network access.
+    /// Create full permissions with read/write filesystem, network access, and standard git operations.
     pub fn standard() -> Self {
         Self {
             filesystem: vec!["read".to_string(), "write".to_string()],
             network: vec!["allow".to_string()],
             shell: vec!["*".to_string()],
+            git: vec!["read".to_string(), "commit".to_string()],
         }
     }
 
@@ -87,7 +91,240 @@ impl AgentPermissions {
             filesystem: vec!["read".to_string()],
             network: Vec::new(),
             shell: Vec::new(),
+            git: vec!["read".to_string()],
         }
+    }
+
+    /// Check if filesystem read operations are permitted.
+    pub fn allows_filesystem_read(&self) -> bool {
+        if self.filesystem.is_empty() {
+            return false;
+        }
+        self.filesystem.iter().any(|f| {
+            f == "read" || f == "write" || f == "workspace_only" || f == "workspace" || f == "*"
+        })
+    }
+
+    /// Check if filesystem write operations are permitted.
+    pub fn allows_filesystem_write(&self) -> bool {
+        if self.filesystem.is_empty() {
+            return false;
+        }
+        if self.filesystem.iter().any(|f| f == "read_only") {
+            return false;
+        }
+        self.filesystem.iter().any(|f| f == "write" || f == "*")
+    }
+
+    /// Check if shell execution is permitted, optionally checking a specific command string.
+    pub fn allows_shell(&self, command: Option<&str>) -> bool {
+        if self.shell.is_empty() {
+            return false;
+        }
+        if self
+            .shell
+            .iter()
+            .any(|s| s == "*" || s == "true" || s == "allow")
+        {
+            return true;
+        }
+        if let Some(cmd) = command {
+            let trimmed = cmd.trim();
+            let first_word = trimmed.split_whitespace().next().unwrap_or(trimmed);
+            self.shell.iter().any(|s| s == trimmed || s == first_word)
+        } else {
+            true
+        }
+    }
+
+    /// Check if network operations are permitted, optionally checking a destination hostname or URL.
+    pub fn allows_network(&self, destination: Option<&str>) -> bool {
+        if self.network.is_empty() {
+            return false;
+        }
+        if self
+            .network
+            .iter()
+            .any(|n| n == "*" || n == "allow" || n == "true")
+        {
+            return true;
+        }
+        if let Some(dest) = destination {
+            self.network.iter().any(|n| n == dest || dest.contains(n))
+        } else {
+            true
+        }
+    }
+
+    /// Check if the specified git operation is permitted.
+    ///
+    /// Git push operations are strictly prohibited unless `"push"` is explicitly listed.
+    pub fn allows_git(&self, op: &str) -> bool {
+        match op {
+            "push" => self.git.iter().any(|g| g == "push"),
+            "commit" | "write" => self
+                .git
+                .iter()
+                .any(|g| g == "commit" || g == "write" || g == "*" || g == "allow" || g == "true"),
+            "read" => self.git.iter().any(|g| {
+                g == "read"
+                    || g == "commit"
+                    || g == "write"
+                    || g == "*"
+                    || g == "allow"
+                    || g == "true"
+            }),
+            _ => self.git.iter().any(|g| g == op || g == "*"),
+        }
+    }
+
+    /// Validate a requested filesystem path against workspace boundary constraints.
+    pub fn validate_filesystem_path(&self, path: &str) -> Result<()> {
+        if self
+            .filesystem
+            .iter()
+            .any(|f| f == "workspace_only" || f == "workspace")
+            && path.contains("..")
+        {
+            return Err(CortexError::PermissionDenied(format!(
+                "path traversal ('..') is prohibited by workspace_only policy: '{}'",
+                path
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a proposed tool call against these permissions prior to execution.
+    ///
+    /// Returns [`CortexError::PermissionDenied`] if the action violates configured boundaries.
+    pub fn validate_tool_call(
+        &self,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        level: crate::tool::PermissionLevel,
+    ) -> Result<()> {
+        match tool_name {
+            "read_file" | "list_dir" | "list_directory" => {
+                if !self.allows_filesystem_read() {
+                    return Err(CortexError::PermissionDenied(format!(
+                        "filesystem read operations are not permitted (tool '{}')",
+                        tool_name
+                    )));
+                }
+                if let Some(path) = arguments.get("path").and_then(|p| p.as_str()) {
+                    self.validate_filesystem_path(path)?;
+                }
+            }
+            "write_file" | "edit_file" | "delete_file" => {
+                if !self.allows_filesystem_write() {
+                    return Err(CortexError::PermissionDenied(format!(
+                        "filesystem write operations are not permitted (tool '{}')",
+                        tool_name
+                    )));
+                }
+                if let Some(path) = arguments.get("path").and_then(|p| p.as_str()) {
+                    self.validate_filesystem_path(path)?;
+                }
+            }
+            "shell" | "bash" | "execute_command" => {
+                let cmd = arguments.get("command").and_then(|c| c.as_str());
+                if !self.allows_shell(cmd) {
+                    let cmd_desc = cmd.unwrap_or("<unknown>");
+                    return Err(CortexError::PermissionDenied(format!(
+                        "shell command execution is not permitted: '{}'",
+                        cmd_desc
+                    )));
+                }
+            }
+            "git_push" => {
+                if !self.allows_git("push") {
+                    return Err(CortexError::PermissionDenied(
+                        "git push is not permitted by capability permissions".to_string(),
+                    ));
+                }
+            }
+            "git_commit" => {
+                if !self.allows_git("commit") {
+                    return Err(CortexError::PermissionDenied(
+                        "git commit is not permitted by capability permissions".to_string(),
+                    ));
+                }
+            }
+            "git_branch" => {
+                let is_create = arguments
+                    .get("create")
+                    .and_then(|c| c.as_bool())
+                    .unwrap_or(false);
+                if is_create {
+                    if !self.allows_git("commit") {
+                        return Err(CortexError::PermissionDenied(
+                            "git branch creation is not permitted by capability permissions"
+                                .to_string(),
+                        ));
+                    }
+                } else if !self.allows_git("read") {
+                    return Err(CortexError::PermissionDenied(
+                        "git branch inspection is not permitted by capability permissions"
+                            .to_string(),
+                    ));
+                }
+            }
+            "git_status" | "git_diff" | "git_log" => {
+                if !self.allows_git("read") {
+                    return Err(CortexError::PermissionDenied(format!(
+                        "git read operations are not permitted (tool '{}')",
+                        tool_name
+                    )));
+                }
+            }
+            _ => {
+                // Check if this appears to be a network-related tool
+                if tool_name.contains("network")
+                    || tool_name.contains("http")
+                    || tool_name.contains("fetch")
+                    || tool_name.contains("curl")
+                    || tool_name.contains("web_search")
+                    || arguments.get("url").is_some()
+                {
+                    let url = arguments.get("url").and_then(|u| u.as_str());
+                    if !self.allows_network(url) {
+                        return Err(CortexError::PermissionDenied(format!(
+                            "network access is not permitted for tool '{}'",
+                            tool_name
+                        )));
+                    }
+                }
+
+                // Fall back to PermissionLevel checks
+                match level {
+                    crate::tool::PermissionLevel::WorkspaceWrite => {
+                        if !self.allows_filesystem_write() {
+                            return Err(CortexError::PermissionDenied(format!(
+                                "workspace write operations are not permitted for tool '{}'",
+                                tool_name
+                            )));
+                        }
+                    }
+                    crate::tool::PermissionLevel::Execute => {
+                        let cmd = arguments.get("command").and_then(|c| c.as_str());
+                        if !self.allows_shell(cmd) {
+                            return Err(CortexError::PermissionDenied(format!(
+                                "subprocess execution is not permitted for tool '{}'",
+                                tool_name
+                            )));
+                        }
+                    }
+                    crate::tool::PermissionLevel::Danger => {
+                        return Err(CortexError::PermissionDenied(format!(
+                            "dangerous tool operations are not permitted for tool '{}'",
+                            tool_name
+                        )));
+                    }
+                    crate::tool::PermissionLevel::ReadOnly => {}
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -324,6 +561,22 @@ pub struct Agent {
     pub created_at: String,
     /// Last state transition timestamp in ISO 8601 UTC.
     pub updated_at: String,
+}
+
+impl Agent {
+    /// Create an execution [`AgentContext`](super::execution::AgentContext) preconfigured
+    /// with this agent's operational permissions, workspace boundary path, and prompt policy.
+    pub fn create_context(&self, task: impl Into<String>) -> super::execution::AgentContext {
+        let mut ctx = super::execution::AgentContext::new(task);
+        if let Some(ref prompt) = self.system_prompt {
+            ctx.messages = vec![
+                super::execution::ChatMessage::System(prompt.clone()),
+                super::execution::ChatMessage::User(ctx.task.clone()),
+            ];
+        }
+        ctx.current_dir = self.workspace.clone();
+        ctx.with_permissions(self.permissions.clone())
+    }
 }
 
 /// Thread-safe manager responsible for agent workers and their lifecycle transitions.
@@ -1253,5 +1506,34 @@ tools:
         assert_eq!(loaded.state, AgentState::Running);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_agent_permissions_boundaries() {
+        let std_perms = AgentPermissions::standard();
+        assert!(std_perms.allows_filesystem_read());
+        assert!(std_perms.allows_filesystem_write());
+        assert!(std_perms.allows_shell(Some("cargo test")));
+        assert!(std_perms.allows_network(Some("https://api.github.com")));
+        assert!(std_perms.allows_git("read"));
+        assert!(std_perms.allows_git("commit"));
+        assert!(!std_perms.allows_git("push")); // push forbidden by default
+
+        let ro_perms = AgentPermissions::read_only();
+        assert!(ro_perms.allows_filesystem_read());
+        assert!(!ro_perms.allows_filesystem_write());
+        assert!(!ro_perms.allows_shell(Some("cargo test")));
+        assert!(!ro_perms.allows_network(None));
+        assert!(ro_perms.allows_git("read"));
+        assert!(!ro_perms.allows_git("commit"));
+        assert!(!ro_perms.allows_git("push"));
+
+        let custom_shell = AgentPermissions {
+            shell: vec!["cargo".to_string(), "git".to_string()],
+            ..Default::default()
+        };
+        assert!(custom_shell.allows_shell(Some("cargo build")));
+        assert!(custom_shell.allows_shell(Some("git status")));
+        assert!(!custom_shell.allows_shell(Some("rm -rf /")));
     }
 }
