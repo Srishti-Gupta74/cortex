@@ -666,4 +666,176 @@ mod tests {
         app.toggle_pause_selected_cron_job();
         assert_eq!(app.cron_jobs[0].status, JobStatus::Active);
     }
+
+    #[test]
+    fn test_live_agent_visualizer_state_lifecycle() {
+        use app::{AgentExecutionPhase, VisualizerToolStatus};
+
+        let mut app = App::new(None);
+        assert!(!app.visualizer.is_open);
+        assert_eq!(app.visualizer.phase, AgentExecutionPhase::Idle);
+        assert_eq!(app.visualizer.sub_tab, 0);
+
+        // Toggle HUD
+        app.toggle_visualizer();
+        assert!(app.visualizer.is_open);
+        app.cycle_visualizer_tab();
+        assert_eq!(app.visualizer.sub_tab, 1);
+        app.cycle_visualizer_tab();
+        assert_eq!(app.visualizer.sub_tab, 2);
+        app.cycle_visualizer_tab();
+        assert_eq!(app.visualizer.sub_tab, 0);
+
+        // Event: on_run_started
+        app.visualizer
+            .on_run_started("run-001", "claude-3-7-sonnet");
+        assert_eq!(app.visualizer.phase, AgentExecutionPhase::Planning);
+        assert_eq!(app.visualizer.current_step, 1);
+        assert_eq!(app.visualizer.tokens_streamed, 0);
+
+        // Event: on_token
+        app.visualizer.on_token("Thinking about architecture...");
+        assert_eq!(app.visualizer.tokens_streamed, 1);
+        assert!(app
+            .visualizer
+            .live_stream_preview
+            .contains("Thinking about architecture"));
+
+        // Event: on_tool_started
+        app.visualizer.on_tool_started("bash", "cargo test");
+        assert_eq!(app.visualizer.phase, AgentExecutionPhase::ToolExecution);
+        assert_eq!(app.visualizer.active_tool, Some("bash".to_string()));
+        assert_eq!(app.visualizer.tool_history.len(), 1);
+        assert_eq!(
+            app.visualizer.tool_history[0].status,
+            VisualizerToolStatus::Running
+        );
+
+        // Event: on_tool_completed
+        app.visualizer
+            .on_tool_completed("bash", "test result: ok", false);
+        assert_eq!(app.visualizer.phase, AgentExecutionPhase::Ingestion);
+        assert_eq!(
+            app.visualizer.tool_history[0].status,
+            VisualizerToolStatus::Success
+        );
+        assert_eq!(app.visualizer.current_step, 2);
+
+        // Event: on_completed
+        app.visualizer.on_completed();
+        assert_eq!(app.visualizer.phase, AgentExecutionPhase::Completed);
+        assert!(app.visualizer.active_tool.is_none());
+
+        // Event: on_cancelled
+        app.visualizer.on_cancelled();
+        assert_eq!(app.visualizer.phase, AgentExecutionPhase::Failed);
+    }
+
+    #[test]
+    fn test_live_agent_visualizer_slash_commands() {
+        use commands::{execute_command, parse_command, SlashCommand};
+
+        let mut app = App::new(None);
+        assert!(!app.visualizer.is_open);
+
+        // /visualizer
+        let cmd = parse_command("/visualizer").expect("parse visualizer command");
+        assert_eq!(cmd, SlashCommand::Visualizer);
+        let resp = execute_command(&mut app, cmd);
+        assert!(app.visualizer.is_open);
+        assert!(resp.contains("Visualizer HUD opened"));
+
+        // /hud alias
+        let cmd = parse_command("/hud").expect("parse hud alias");
+        assert_eq!(cmd, SlashCommand::Visualizer);
+        let resp = execute_command(&mut app, cmd);
+        assert!(!app.visualizer.is_open);
+        assert!(resp.contains("Visualizer HUD closed"));
+
+        // /viz alias
+        let cmd = parse_command("/viz").expect("parse viz alias");
+        assert_eq!(cmd, SlashCommand::Visualizer);
+        execute_command(&mut app, cmd);
+        assert!(app.visualizer.is_open);
+    }
+
+    #[test]
+    fn test_live_agent_visualizer_headless_rendering() {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).expect("create test terminal");
+        let mut app = App::new(None);
+
+        // 1. Render with visualizer closed (standard chat view)
+        terminal
+            .draw(|f| ui::render(f, &app))
+            .expect("draw chat with visualizer closed");
+        let content_closed: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content_closed.contains("Ctrl+V: Visualizer"));
+        assert!(!content_closed.contains("LIVE AGENT MISSION CONTROL"));
+
+        // 2. Open visualizer in sub-tab 0 (Pipeline)
+        app.visualizer.is_open = true;
+        app.visualizer
+            .on_run_started("run-test-viz", "claude-3-7-sonnet");
+        app.visualizer
+            .on_token("Analyzing repository security invariants");
+        app.visualizer.on_tool_started("fs_read", "path: AGENTS.md");
+
+        terminal
+            .draw(|f| ui::render(f, &app))
+            .expect("draw visualizer tab 0");
+        let content_tab0: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content_tab0.contains("LIVE AGENT MISSION CONTROL"));
+        assert!(content_tab0.contains("5-Stage Agent Lifecycle State Machine"));
+        assert!(content_tab0.contains("Step Budget"));
+        assert!(content_tab0.contains("Security & Isolation Posture"));
+        assert!(content_tab0.contains("Live Streaming Reasoning"));
+
+        // 3. Switch to sub-tab 1 (Tool Call Graph)
+        app.visualizer.cycle_tab();
+        assert_eq!(app.visualizer.sub_tab, 1);
+        terminal
+            .draw(|f| ui::render(f, &app))
+            .expect("draw visualizer tab 1");
+        let content_tab1: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content_tab1.contains("Call Graph & Execution Summary"));
+        assert!(content_tab1.contains("Tool Call History"));
+        assert!(content_tab1.contains("fs_read"));
+
+        // 4. Switch to sub-tab 2 (Security & Sandboxing)
+        app.visualizer.cycle_tab();
+        assert_eq!(app.visualizer.sub_tab, 2);
+        terminal
+            .draw(|f| ui::render(f, &app))
+            .expect("draw visualizer tab 2");
+        let content_tab2: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(content_tab2.contains("Core Cortex Security Architecture"));
+        assert!(content_tab2.contains("Model Output vs. Runtime Authority"));
+        assert!(content_tab2.contains("Filesystem Jail"));
+        assert!(content_tab2.contains("Subprocess Sandbox"));
+    }
 }

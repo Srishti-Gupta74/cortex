@@ -109,6 +109,12 @@ pub static COMMAND_CATALOG: &[CommandDefinition] = &[
         aliases: &["scheduler", "jobs"],
     },
     CommandDefinition {
+        name: "visualizer",
+        description: "Toggle live agent mission control visualizer HUD",
+        usage: "/visualizer",
+        aliases: &["viz", "hud"],
+    },
+    CommandDefinition {
         name: "exit",
         description: "Exit interactive agent harness",
         usage: "/exit",
@@ -205,6 +211,8 @@ pub enum SlashCommand {
         /// Subcommand arguments.
         args: Vec<String>,
     },
+    /// Toggle live agent mission control visualizer HUD.
+    Visualizer,
     /// Exit the TUI harness.
     Quit,
     /// Unrecognized slash command.
@@ -254,6 +262,7 @@ pub fn parse_command(input: &str) -> Option<SlashCommand> {
         }
         "team" | "coordination" => Some(SlashCommand::Team { args }),
         "cron" | "scheduler" | "jobs" => Some(SlashCommand::Cron { args }),
+        "visualizer" | "viz" | "hud" => Some(SlashCommand::Visualizer),
         "quit" | "exit" | "q" => Some(SlashCommand::Quit),
         other => Some(SlashCommand::Unknown(other.to_string())),
     }
@@ -283,6 +292,14 @@ pub fn execute_command(app: &mut App, command: SlashCommand) -> String {
         SlashCommand::Resume { id } => handle_resume_command(app, &id),
         SlashCommand::Team { args } => handle_team_command(app, &args),
         SlashCommand::Cron { args } => handle_scheduler_command(app, &args),
+        SlashCommand::Visualizer => {
+            app.toggle_visualizer();
+            if app.visualizer.is_open {
+                "✓ Live Agent Visualizer HUD opened (Press Ctrl+V or Esc to close).".to_string()
+            } else {
+                "✓ Live Agent Visualizer HUD closed.".to_string()
+            }
+        }
         SlashCommand::Quit => {
             app.should_quit = true;
             "Exiting Cortex TUI... Goodbye!".to_string()

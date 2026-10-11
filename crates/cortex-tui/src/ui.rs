@@ -3,7 +3,8 @@
 #![allow(dead_code)]
 
 use crate::app::{
-    ActiveTab, App, ChatRole, PortalField, PortalInputMode, StageStatus, TeamAgentStatus,
+    ActiveTab, AgentExecutionPhase, App, ChatRole, PortalField, PortalInputMode, StageStatus,
+    TeamAgentStatus, VisualizerToolStatus,
 };
 use crate::theme;
 use cortex_core::ExecutionEvent;
@@ -47,6 +48,11 @@ pub fn render(frame: &mut Frame, app: &App) {
         }
 
         render_footer(frame, app, chunks[2]);
+    }
+
+    // Overlay the Live Agent Mission Control Visualizer HUD if toggled
+    if app.visualizer.is_open {
+        render_live_agent_visualizer(frame, app, frame.area());
     }
 }
 
@@ -1394,6 +1400,11 @@ fn render_chat(frame: &mut Frame, app: &App, area: Rect) {
             "/help for commands",
             Style::default().fg(theme::COLOR_MUTED),
         ),
+        Span::styled(" · ", Style::default().fg(theme::COLOR_SUBTLE)),
+        Span::styled(
+            "Ctrl+V: Visualizer",
+            Style::default().fg(theme::COLOR_MUTED),
+        ),
     ]);
     frame.render_widget(Paragraph::new(status_line), chunks[4]);
 }
@@ -2099,6 +2110,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw(": Send | "),
             Span::styled("Ctrl+T", Style::default().fg(Color::Yellow)),
             Span::raw(": Thinking | "),
+            Span::styled("Ctrl+V", Style::default().fg(Color::Yellow)),
+            Span::raw(": Visualizer | "),
             Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
             Span::raw(": History | "),
             Span::styled("Tab", Style::default().fg(Color::Yellow)),
@@ -2191,6 +2204,8 @@ fn render_footer(frame: &mut Frame, app: &App, area: Rect) {
         _ => vec![
             Span::styled("Tab / 1-9", Style::default().fg(Color::Yellow)),
             Span::raw(": Switch Tabs | "),
+            Span::styled("v", Style::default().fg(Color::Yellow)),
+            Span::raw(": Visualizer | "),
             Span::styled("↑/↓", Style::default().fg(Color::Yellow)),
             Span::raw(": Navigate | "),
             Span::styled("Enter", Style::default().fg(Color::Yellow)),
@@ -2904,4 +2919,726 @@ fn render_cron_drawer(frame: &mut Frame, app: &App, area: Rect) {
         );
         frame.render_widget(p, chunks[1]);
     }
+}
+
+/// Render the live agent mission control visualizer HUD overlay modal.
+pub fn render_live_agent_visualizer(frame: &mut Frame, app: &App, area: Rect) {
+    if area.width < 30 || area.height < 10 {
+        return;
+    }
+
+    let modal_w = ((area.width as f32 * 0.92) as u16).max(50).min(area.width);
+    let modal_h = ((area.height as f32 * 0.88) as u16)
+        .max(18)
+        .min(area.height);
+    let modal_x = area.x + (area.width.saturating_sub(modal_w)) / 2;
+    let modal_y = area.y + (area.height.saturating_sub(modal_h)) / 2;
+    let modal_rect = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+    // Clear background for overlay
+    frame.render_widget(Clear, modal_rect);
+
+    let (border_color, status_glyph) = match app.visualizer.phase {
+        AgentExecutionPhase::Idle => (theme::COLOR_MUTED, "●"),
+        AgentExecutionPhase::Planning => (theme::COLOR_PRIMARY, "⚙"),
+        AgentExecutionPhase::ApprovalGate => (theme::COLOR_WARNING, "🔒"),
+        AgentExecutionPhase::ToolExecution => (theme::COLOR_SECONDARY, "⚡"),
+        AgentExecutionPhase::Ingestion => (theme::COLOR_ACCENT, "📥"),
+        AgentExecutionPhase::Completed => (theme::COLOR_SUCCESS, "✓"),
+        AgentExecutionPhase::Failed => (theme::COLOR_ERROR, "✗"),
+    };
+
+    let title_line = Line::from(vec![
+        Span::styled(
+            " 🛰️  LIVE AGENT MISSION CONTROL · ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("{} ", status_glyph),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            app.visualizer.phase.label(),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " · [Tab: Switch View | Esc/Ctrl+V: Close | c: Cancel] ",
+            Style::default().fg(theme::COLOR_MUTED),
+        ),
+    ]);
+
+    let outer_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_color))
+        .title(title_line);
+
+    let inner = outer_block.inner(modal_rect);
+    frame.render_widget(outer_block, modal_rect);
+
+    if inner.height < 6 || inner.width < 20 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Sub-tabs header
+            Constraint::Min(4),    // Main content
+        ])
+        .split(inner);
+
+    // Render Sub-tabs bar
+    let tab_titles = vec![
+        Line::from(vec![
+            Span::styled("1. ", Style::default().fg(theme::COLOR_ACCENT)),
+            Span::raw("Pipeline & State Machine"),
+        ]),
+        Line::from(vec![
+            Span::styled("2. ", Style::default().fg(theme::COLOR_ACCENT)),
+            Span::raw(format!(
+                "Tool Call Graph ({})",
+                app.visualizer.tool_history.len()
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("3. ", Style::default().fg(theme::COLOR_ACCENT)),
+            Span::raw("Security & Sandboxing"),
+        ]),
+    ];
+
+    let tabs_widget = Tabs::new(tab_titles)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme::COLOR_SUBTLE)),
+        )
+        .select(app.visualizer.sub_tab % 3)
+        .style(Style::default().fg(theme::COLOR_MUTED))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        )
+        .divider(Span::styled(
+            " │ ",
+            Style::default().fg(theme::COLOR_SUBTLE),
+        ));
+
+    frame.render_widget(tabs_widget, chunks[0]);
+
+    match app.visualizer.sub_tab % 3 {
+        0 => render_visualizer_pipeline(frame, app, chunks[1]),
+        1 => render_visualizer_tools(frame, app, chunks[1]),
+        _ => render_visualizer_security(frame, app, chunks[1]),
+    }
+}
+
+fn render_visualizer_pipeline(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height < 6 || area.width < 20 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(6), // Lifecycle state machine ASCII pipeline
+            Constraint::Length(7), // Telemetry & Step Budget
+            Constraint::Min(4),    // Live Thought & Stream snippet
+        ])
+        .split(area);
+
+    // 1. Five-stage Lifecycle State Machine Diagram
+    let current_phase = app.visualizer.phase;
+    let mut diagram_lines: Vec<Line> = Vec::new();
+
+    let stages = [
+        ("PROMPT", AgentExecutionPhase::Idle),
+        ("PLANNING", AgentExecutionPhase::Planning),
+        ("SECURITY GATE", AgentExecutionPhase::ApprovalGate),
+        ("TOOL RUNNER", AgentExecutionPhase::ToolExecution),
+        ("INGESTION", AgentExecutionPhase::Ingestion),
+    ];
+
+    let mut nodes_line: Vec<Span> = Vec::new();
+    nodes_line.push(Span::raw("  "));
+
+    let stage_rank = |p: AgentExecutionPhase| match p {
+        AgentExecutionPhase::Idle => 0,
+        AgentExecutionPhase::Planning => 1,
+        AgentExecutionPhase::ApprovalGate => 2,
+        AgentExecutionPhase::ToolExecution => 3,
+        AgentExecutionPhase::Ingestion => 4,
+        AgentExecutionPhase::Completed => 5,
+        AgentExecutionPhase::Failed => 0,
+    };
+
+    for (i, (name, phase)) in stages.iter().enumerate() {
+        let is_active = current_phase == *phase;
+        let is_past = current_phase == AgentExecutionPhase::Completed
+            || stage_rank(current_phase) > stage_rank(*phase);
+
+        if is_active {
+            nodes_line.push(Span::styled(
+                format!("[ ▶ {} ]", name),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if is_past {
+            nodes_line.push(Span::styled(
+                format!("[ ✓ {} ]", name),
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            nodes_line.push(Span::styled(
+                format!("[ · {} ]", name),
+                Style::default().fg(theme::COLOR_MUTED),
+            ));
+        }
+
+        if i + 1 < stages.len() {
+            let arrow_style = if is_active || is_past {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::COLOR_SUBTLE)
+            };
+            nodes_line.push(Span::styled(" ──► ", arrow_style));
+        }
+    }
+    diagram_lines.push(Line::raw(""));
+    diagram_lines.push(Line::from(nodes_line));
+
+    let phase_desc = match current_phase {
+        AgentExecutionPhase::Idle => "Agent is idle. Ready to receive commands or user prompt.",
+        AgentExecutionPhase::Planning => {
+            "LLM reasoning active: generating plan and synthesizing tool parameters."
+        }
+        AgentExecutionPhase::ApprovalGate => {
+            "Evaluating security policies: validating workspace constraints and privileges."
+        }
+        AgentExecutionPhase::ToolExecution => {
+            "Executing external tool within isolated subprocess boundary."
+        }
+        AgentExecutionPhase::Ingestion => {
+            "Parsing tool output, synchronizing working memory and updating context."
+        }
+        AgentExecutionPhase::Completed => {
+            "Execution cycle finished successfully. Final output returned."
+        }
+        AgentExecutionPhase::Failed => {
+            "Execution interrupted, halted by operator, or encountered an error."
+        }
+    };
+    diagram_lines.push(Line::raw(""));
+    diagram_lines.push(Line::from(vec![
+        Span::styled(
+            "  Current Status: ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(phase_desc, Style::default().fg(theme::COLOR_ACCENT)),
+    ]));
+
+    let pipeline_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+        .title(" 5-Stage Agent Lifecycle State Machine ");
+    frame.render_widget(
+        Paragraph::new(diagram_lines).block(pipeline_block),
+        chunks[0],
+    );
+
+    // 2. Telemetry and Step Budget cards
+    let telemetry_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    let cur_step = app.visualizer.current_step;
+    let max_steps = app.visualizer.max_steps;
+    let pct = if max_steps > 0 {
+        (cur_step as f32 / max_steps as f32).min(1.0)
+    } else {
+        0.0
+    };
+    let bar_len = 18usize;
+    let filled = ((pct * bar_len as f32).round() as usize).min(bar_len);
+    let empty = bar_len.saturating_sub(filled);
+    let bar_str = format!(
+        "[{}{}] {}/{} ({}%)",
+        "█".repeat(filled),
+        "░".repeat(empty),
+        cur_step,
+        max_steps,
+        (pct * 100.0) as usize
+    );
+
+    let active_tool_display = app
+        .visualizer
+        .active_tool
+        .clone()
+        .unwrap_or_else(|| "None (Model Reasoning)".to_string());
+    let active_args_display = app
+        .visualizer
+        .active_tool_args
+        .clone()
+        .unwrap_or_else(|| "-".to_string());
+
+    let left_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " Step Budget:     ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(bar_str, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " Active Tool:     ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(active_tool_display, Style::default().fg(Color::White)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " Tool Args:       ",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+            Span::styled(active_args_display, Style::default().fg(theme::COLOR_MUTED)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " Streamed Tokens: ",
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} tokens", app.visualizer.tokens_streamed),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                format!("  (Total calls: {})", app.visualizer.tool_history.len()),
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+        ]),
+    ];
+
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+        .title(" Execution Telemetry ");
+    frame.render_widget(
+        Paragraph::new(left_lines).block(left_block),
+        telemetry_cols[0],
+    );
+
+    let right_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                " Runtime Authority:   ",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+            Span::styled(
+                "UNTRUSTED (Model isolated)",
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " Workspace Jail:      ",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+            Span::styled(
+                "Enforced (Root contained)",
+                Style::default().fg(theme::COLOR_SUCCESS),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " Environment Filter:  ",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+            Span::styled(
+                "Sanitized (Zero secret leak)",
+                Style::default().fg(theme::COLOR_SUCCESS),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                " Operator Intervene:  ",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+            Span::styled(
+                "Press 'c' to cancel run immediately",
+                Style::default().fg(Color::Yellow),
+            ),
+        ]),
+    ];
+
+    let right_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+        .title(" Security & Isolation Posture ");
+    frame.render_widget(
+        Paragraph::new(right_lines).block(right_block),
+        telemetry_cols[1],
+    );
+
+    // 3. Live Thought & Stream snippet
+    let stream_content = if app.visualizer.live_stream_preview.is_empty() {
+        vec![Line::from(Span::styled(
+            "Waiting for model tokens or execution output... Standby.",
+            Style::default().fg(theme::COLOR_MUTED),
+        ))]
+    } else {
+        vec![Line::from(vec![
+            Span::styled(
+                &app.visualizer.live_stream_preview,
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(
+                " ▋",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])]
+    };
+
+    let stream_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+        .title(" Live Streaming Reasoning / Thought Preview ");
+    frame.render_widget(
+        Paragraph::new(stream_content)
+            .block(stream_block)
+            .wrap(Wrap { trim: false }),
+        chunks[2],
+    );
+}
+
+fn render_visualizer_tools(frame: &mut Frame, app: &App, area: Rect) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Summary bar
+            Constraint::Min(4),    // History table
+        ])
+        .split(area);
+
+    let total = app.visualizer.tool_history.len();
+    let successes = app
+        .visualizer
+        .tool_history
+        .iter()
+        .filter(|t| t.status == VisualizerToolStatus::Success)
+        .count();
+    let errors = app
+        .visualizer
+        .tool_history
+        .iter()
+        .filter(|t| t.status == VisualizerToolStatus::Error)
+        .count();
+    let running = app
+        .visualizer
+        .tool_history
+        .iter()
+        .filter(|t| t.status == VisualizerToolStatus::Running)
+        .count();
+
+    let summary_line = Line::from(vec![
+        Span::styled(
+            format!("Total Tool Calls: {} ", total),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · ", Style::default().fg(theme::COLOR_SUBTLE)),
+        Span::styled(
+            format!("✓ Succeeded: {} ", successes),
+            Style::default().fg(theme::COLOR_SUCCESS),
+        ),
+        Span::styled(" · ", Style::default().fg(theme::COLOR_SUBTLE)),
+        Span::styled(
+            format!("✗ Failed: {} ", errors),
+            Style::default().fg(if errors > 0 {
+                theme::COLOR_ERROR
+            } else {
+                theme::COLOR_MUTED
+            }),
+        ),
+        Span::styled(" · ", Style::default().fg(theme::COLOR_SUBTLE)),
+        Span::styled(
+            format!("⚙ Active: {} ", running),
+            Style::default().fg(if running > 0 {
+                Color::Yellow
+            } else {
+                theme::COLOR_MUTED
+            }),
+        ),
+    ]);
+
+    let summary_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+        .title(" Call Graph & Execution Summary ");
+    frame.render_widget(Paragraph::new(summary_line).block(summary_block), chunks[0]);
+
+    if app.visualizer.tool_history.is_empty() {
+        let empty_msg = Paragraph::new(
+            "No tool executions recorded yet in this session.\nPrompt the agent to trigger tool calls and view real-time traces here.",
+        )
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+                .title(" Tool Call History "),
+        )
+        .style(Style::default().fg(theme::COLOR_MUTED));
+        frame.render_widget(empty_msg, chunks[1]);
+        return;
+    }
+
+    let header = Row::new(vec![
+        Cell::from("TIME").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("TOOL NAME").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("STATUS").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("ARGUMENTS SUMMARY").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Cell::from("OUTPUT PREVIEW").style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ])
+    .bottom_margin(1);
+
+    let rows: Vec<Row> = app
+        .visualizer
+        .tool_history
+        .iter()
+        .rev()
+        .take(30)
+        .map(|item| {
+            let (status_text, status_style) = match item.status {
+                VisualizerToolStatus::Running => ("⚙ Running", Style::default().fg(Color::Yellow)),
+                VisualizerToolStatus::Success => {
+                    ("✓ Success", Style::default().fg(theme::COLOR_SUCCESS))
+                }
+                VisualizerToolStatus::Error => ("✗ Error", Style::default().fg(theme::COLOR_ERROR)),
+            };
+
+            let preview = item.result_preview.as_deref().unwrap_or("...");
+
+            Row::new(vec![
+                Cell::from(item.timestamp.clone()).style(Style::default().fg(theme::COLOR_MUTED)),
+                Cell::from(item.name.clone()).style(
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Cell::from(status_text).style(status_style),
+                Cell::from(item.args_summary.clone())
+                    .style(Style::default().fg(theme::COLOR_ACCENT)),
+                Cell::from(preview).style(Style::default().fg(theme::COLOR_MUTED)),
+            ])
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(10),
+            Constraint::Length(16),
+            Constraint::Length(12),
+            Constraint::Percentage(32),
+            Constraint::Percentage(32),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+            .title(" Tool Call History (Latest First) "),
+    );
+
+    frame.render_widget(table, chunks[1]);
+}
+
+fn render_visualizer_security(frame: &mut Frame, _app: &App, area: Rect) {
+    if area.height < 4 || area.width < 20 {
+        return;
+    }
+
+    let security_items = vec![
+        Line::from(vec![
+            Span::styled(
+                " [✓ ENFORCED] ",
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Model Output vs. Runtime Authority Separation",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled(
+                "Model outputs are strictly untrusted data strings. The runtime compiler validates and enforces all schemas before execution.",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " [✓ ENFORCED] ",
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Filesystem Jail & Path Traversal Prevention",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled(
+                "Relative paths are resolved against workspace root; directory traversal ('../', absolute symlinks) is rejected with EACCES.",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " [✓ ENFORCED] ",
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Subprocess Sandbox & Environment Scrubbing",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled(
+                "Host credentials (AWS_*, GITHUB_*, OPENAI_*) are stripped from child processes. Tools run with unprivileged tokens.",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " [✓ ENFORCED] ",
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Human-in-the-Loop (HITL) Gatekeeper",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled(
+                "Destructive filesystem alterations, shell execution, and network egress require explicit operator authorization.",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+        ]),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled(
+                " [✓ ENFORCED] ",
+                Style::default()
+                    .fg(theme::COLOR_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Immutable SQLite WAL Audit Ledger",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::raw("    • "),
+            Span::styled(
+                "Every prompt, reasoning chain, tool invocation, argument hash, and exit code is durably recorded in ~/.cortex/events.db.",
+                Style::default().fg(theme::COLOR_MUTED),
+            ),
+        ]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme::COLOR_SUBTLE))
+        .title(" Core Cortex Security Architecture & Invariants ");
+
+    frame.render_widget(
+        Paragraph::new(security_items)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }

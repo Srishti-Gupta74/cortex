@@ -23,6 +23,38 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
+    // Global shortcut: Ctrl+V toggles the Live Agent Visualizer HUD across all screens
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && (key.code == KeyCode::Char('v') || key.code == KeyCode::Char('V'))
+    {
+        app.toggle_visualizer();
+        return;
+    }
+
+    // Modal navigation when the Live Agent Visualizer HUD is open
+    if app.visualizer.is_open {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('V') => {
+                app.close_visualizer();
+                return;
+            }
+            KeyCode::Tab => {
+                app.cycle_visualizer_tab();
+                return;
+            }
+            KeyCode::Char('c') | KeyCode::Char('C') => {
+                if app.chat_is_running {
+                    app.cancel_chat_agent();
+                }
+                return;
+            }
+            _ => {
+                // Trap all other keys while HUD is open
+                return;
+            }
+        }
+    }
+
     // Dedicated routing for the interactive Chat harness tab
     if app.active_tab == ActiveTab::Chat {
         // Handle Ctrl shortcuts first
@@ -250,6 +282,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('9') => {
             app.set_tab(ActiveTab::Scheduler);
+        }
+        KeyCode::Char('v') | KeyCode::Char('V') => {
+            app.toggle_visualizer();
         }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.refresh();
@@ -495,5 +530,39 @@ mod tests {
         // Second Ctrl+C forces quit immediately
         handle_key(&mut app, make_ctrl_key(KeyCode::Char('c')));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn test_visualizer_key_events() {
+        let mut app = App::new(None);
+        assert!(!app.visualizer.is_open);
+
+        // Ctrl+V toggles visualizer open
+        handle_key(&mut app, make_ctrl_key(KeyCode::Char('v')));
+        assert!(app.visualizer.is_open);
+
+        // Tab cycles visualizer sub-tab
+        assert_eq!(app.visualizer.sub_tab, 0);
+        handle_key(&mut app, make_key(KeyCode::Tab));
+        assert_eq!(app.visualizer.sub_tab, 1);
+        handle_key(&mut app, make_key(KeyCode::Tab));
+        assert_eq!(app.visualizer.sub_tab, 2);
+        handle_key(&mut app, make_key(KeyCode::Tab));
+        assert_eq!(app.visualizer.sub_tab, 0);
+
+        // 'v' closes visualizer when open
+        handle_key(&mut app, make_key(KeyCode::Char('v')));
+        assert!(!app.visualizer.is_open);
+
+        // Ctrl+V opens again, Esc closes
+        handle_key(&mut app, make_ctrl_key(KeyCode::Char('v')));
+        assert!(app.visualizer.is_open);
+        handle_key(&mut app, make_key(KeyCode::Esc));
+        assert!(!app.visualizer.is_open);
+
+        // Non-chat tab 'v' key toggles visualizer
+        app.set_tab(ActiveTab::Dashboard);
+        handle_key(&mut app, make_key(KeyCode::Char('v')));
+        assert!(app.visualizer.is_open);
     }
 }

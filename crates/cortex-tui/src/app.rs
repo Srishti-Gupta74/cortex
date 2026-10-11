@@ -645,6 +645,199 @@ pub struct AutocompleteState {
     pub selected_idx: usize,
 }
 
+/// Current execution phase of an autonomous agent lifecycle for visualizer HUD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentExecutionPhase {
+    /// Agent is idle and standing by for user prompt.
+    #[default]
+    Idle,
+    /// Model provider is active (thinking, streaming reasoning tokens).
+    Planning,
+    /// Evaluating security approval policies (HITL gate check).
+    ApprovalGate,
+    /// Executing a tool invocation within sandbox boundaries.
+    ToolExecution,
+    /// Ingesting tool output and updating context memory.
+    Ingestion,
+    /// Execution completed successfully.
+    Completed,
+    /// Execution failed or was interrupted/cancelled.
+    Failed,
+}
+
+impl AgentExecutionPhase {
+    /// Human-readable label for HUD display.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Idle => "IDLE · STANDBY",
+            Self::Planning => "THINKING & PLANNING",
+            Self::ApprovalGate => "SECURITY APPROVAL GATE",
+            Self::ToolExecution => "TOOL EXECUTION",
+            Self::Ingestion => "INGESTING RESULTS",
+            Self::Completed => "COMPLETED",
+            Self::Failed => "FAILED / CANCELLED",
+        }
+    }
+}
+
+/// Status of an individual tool invocation recorded in the visualizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VisualizerToolStatus {
+    /// Tool is currently executing.
+    Running,
+    /// Tool completed successfully.
+    Success,
+    /// Tool execution returned an error.
+    Error,
+}
+
+/// Recorded tool execution entry for visualizer telemetry.
+#[derive(Debug, Clone)]
+pub struct VisualizerToolEvent {
+    /// Name of the tool invoked.
+    pub name: String,
+    /// Single-line summary of tool arguments.
+    pub args_summary: String,
+    /// Outcome status of the tool execution.
+    pub status: VisualizerToolStatus,
+    /// Formatted wall-clock timestamp of invocation.
+    pub timestamp: String,
+    /// Truncated preview snippet of tool output.
+    pub result_preview: Option<String>,
+}
+
+/// State tracking the live agent mission control visualizer HUD.
+#[derive(Debug, Clone)]
+pub struct LiveAgentVisualizer {
+    /// Whether the visualizer HUD modal is currently open.
+    pub is_open: bool,
+    /// Current lifecycle phase.
+    pub phase: AgentExecutionPhase,
+    /// Current execution step / iteration counter.
+    pub current_step: usize,
+    /// Step budget limit.
+    pub max_steps: usize,
+    /// Currently executing tool name, if any.
+    pub active_tool: Option<String>,
+    /// Arguments summary for active tool.
+    pub active_tool_args: Option<String>,
+    /// Summary of the last tool result.
+    pub last_tool_result: Option<String>,
+    /// Chronological list of tool events during current session.
+    pub tool_history: Vec<VisualizerToolEvent>,
+    /// Total tokens streamed in current task.
+    pub tokens_streamed: usize,
+    /// Live snippet of model thought or output.
+    pub live_stream_preview: String,
+    /// Sub-tab within visualizer HUD (0 = Overview/Pipeline, 1 = Tool Calls, 2 = Security Boundaries).
+    pub sub_tab: usize,
+}
+
+impl Default for LiveAgentVisualizer {
+    fn default() -> Self {
+        Self {
+            is_open: false,
+            phase: AgentExecutionPhase::Idle,
+            current_step: 0,
+            max_steps: 25,
+            active_tool: None,
+            active_tool_args: None,
+            last_tool_result: None,
+            tool_history: Vec::new(),
+            tokens_streamed: 0,
+            live_stream_preview: String::new(),
+            sub_tab: 0,
+        }
+    }
+}
+
+impl LiveAgentVisualizer {
+    /// Toggle visibility of the HUD visualizer modal.
+    pub fn toggle(&mut self) {
+        self.is_open = !self.is_open;
+    }
+
+    /// Explicitly close the HUD visualizer.
+    pub fn close(&mut self) {
+        self.is_open = false;
+    }
+
+    /// Cycle through HUD sub-tabs: 0 (Pipeline) -> 1 (Tools) -> 2 (Security) -> 0.
+    pub fn cycle_tab(&mut self) {
+        self.sub_tab = (self.sub_tab + 1) % 3;
+    }
+
+    /// Reset live counters upon starting a new execution run.
+    pub fn on_run_started(&mut self, _run_id: &str, _model: &str) {
+        self.phase = AgentExecutionPhase::Planning;
+        self.current_step = 1;
+        self.active_tool = None;
+        self.active_tool_args = None;
+        self.last_tool_result = None;
+        self.tokens_streamed = 0;
+        self.live_stream_preview.clear();
+        self.tool_history.clear();
+    }
+
+    /// Ingest a streaming token into the live preview.
+    pub fn on_token(&mut self, token: &str) {
+        self.phase = AgentExecutionPhase::Planning;
+        self.tokens_streamed = self.tokens_streamed.saturating_add(1);
+        self.live_stream_preview.push_str(token);
+        if self.live_stream_preview.len() > 600 {
+            let keep_start = self.live_stream_preview.len() - 500;
+            self.live_stream_preview = self.live_stream_preview[keep_start..].to_string();
+        }
+    }
+
+    /// Ingest a tool execution started event.
+    pub fn on_tool_started(&mut self, name: &str, args: &str) {
+        self.phase = AgentExecutionPhase::ToolExecution;
+        self.active_tool = Some(name.to_string());
+        let summary = args.lines().next().unwrap_or(args).trim().to_string();
+        self.active_tool_args = Some(summary.clone());
+        let now = chrono::Utc::now().format("%H:%M:%S").to_string();
+        self.tool_history.push(VisualizerToolEvent {
+            name: name.to_string(),
+            args_summary: summary,
+            status: VisualizerToolStatus::Running,
+            timestamp: now,
+            result_preview: None,
+        });
+        if self.tool_history.len() > 50 {
+            self.tool_history.remove(0);
+        }
+    }
+
+    /// Ingest a tool execution completed event.
+    pub fn on_tool_completed(&mut self, _name: &str, output: &str, is_error: bool) {
+        self.phase = AgentExecutionPhase::Ingestion;
+        let preview = output.lines().next().unwrap_or(output).trim().to_string();
+        self.last_tool_result = Some(preview.clone());
+        if let Some(last) = self.tool_history.last_mut() {
+            last.status = if is_error {
+                VisualizerToolStatus::Error
+            } else {
+                VisualizerToolStatus::Success
+            };
+            last.result_preview = Some(preview);
+        }
+        self.current_step = (self.current_step + 1).min(self.max_steps);
+    }
+
+    /// Ingest run completed event.
+    pub fn on_completed(&mut self) {
+        self.phase = AgentExecutionPhase::Completed;
+        self.active_tool = None;
+    }
+
+    /// Ingest run failed or cancelled event.
+    pub fn on_cancelled(&mut self) {
+        self.phase = AgentExecutionPhase::Failed;
+        self.active_tool = None;
+    }
+}
+
 /// Execution handle for an asynchronous agent execution thread.
 pub struct AgentExecutionHandle {
     /// Cancellation token to stop the running agent.
@@ -788,6 +981,10 @@ pub struct App {
     pub selected_cron_run_idx: usize,
     /// Whether the execution run drawer is expanded / focused.
     pub cron_drawer_open: bool,
+
+    // Live Agent Visualizer HUD
+    /// Live mission control visualizer HUD state.
+    pub visualizer: LiveAgentVisualizer,
 }
 
 impl App {
@@ -889,6 +1086,7 @@ impl App {
             cron_job_runs: Vec::new(),
             selected_cron_run_idx: 0,
             cron_drawer_open: false,
+            visualizer: LiveAgentVisualizer::default(),
         };
 
         // Ensure user settings file exists in ~/.cortex
@@ -1730,6 +1928,7 @@ impl App {
                     ChatAgentUpdate::Started { run_id, model } => {
                         handle.run_id = Some(run_id.clone());
                         new_run_id = Some(run_id.clone());
+                        self.visualizer.on_run_started(&run_id, &model);
                         self.chat_messages.push(ChatMessageItem {
                             role: ChatRole::System,
                             content: format!(
@@ -1741,6 +1940,7 @@ impl App {
                         });
                     }
                     ChatAgentUpdate::Token(token) => {
+                        self.visualizer.on_token(&token);
                         if let Some(last) = self.chat_messages.last_mut() {
                             if last.role == ChatRole::Assistant {
                                 last.content.push_str(&token);
@@ -1755,6 +1955,7 @@ impl App {
                     }
                     ChatAgentUpdate::ToolStarted { name, args } => {
                         let formatted = format_tool_start(&name, &args);
+                        self.visualizer.on_tool_started(&name, &args);
                         self.chat_messages
                             .push(ChatMessageItem::new(ChatRole::Tool, formatted));
                     }
@@ -1764,6 +1965,7 @@ impl App {
                         is_error,
                     } => {
                         let formatted = format_tool_end(&name, &output, is_error);
+                        self.visualizer.on_tool_completed(&name, &output, is_error);
                         self.chat_messages.push(ChatMessageItem::new(
                             if is_error {
                                 ChatRole::Error
@@ -1777,6 +1979,7 @@ impl App {
                         self.session_tokens += res.tokens_total as u64;
                         self.session_cost += res.estimated_cost_usd;
                         self.run_start_instant = None;
+                        self.visualizer.on_completed();
 
                         // Ensure final answer is displayed if streaming was quiet
                         let has_assistant = self.chat_messages.last().is_some_and(|m| {
@@ -1830,6 +2033,7 @@ impl App {
                     }
                     ChatAgentUpdate::Cancelled(reason) => {
                         self.run_start_instant = None;
+                        self.visualizer.on_cancelled();
                         self.chat_messages.push(ChatMessageItem {
                             role: ChatRole::System,
                             content: format!("Agent run cancelled: {}", reason),
@@ -1840,6 +2044,7 @@ impl App {
                     }
                     ChatAgentUpdate::Error(err) => {
                         self.run_start_instant = None;
+                        self.visualizer.on_cancelled();
                         self.chat_messages.push(ChatMessageItem {
                             role: ChatRole::Error,
                             content: format!("Agent execution error: {}", err),
@@ -1948,6 +2153,21 @@ impl App {
     /// Cycle stage filter in coordination viewer.
     pub fn cycle_stage_filter(&mut self) {
         self.coordination.cycle_stage_filter();
+    }
+
+    /// Toggle visibility of the Live Agent Visualizer HUD.
+    pub fn toggle_visualizer(&mut self) {
+        self.visualizer.toggle();
+    }
+
+    /// Close the Live Agent Visualizer HUD.
+    pub fn close_visualizer(&mut self) {
+        self.visualizer.close();
+    }
+
+    /// Cycle through sub-tabs in the Live Agent Visualizer HUD.
+    pub fn cycle_visualizer_tab(&mut self) {
+        self.visualizer.cycle_tab();
     }
 
     /// Ingest an ExecutionEvent to update coordination state if applicable.
