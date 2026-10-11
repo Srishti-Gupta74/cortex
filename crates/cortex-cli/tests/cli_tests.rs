@@ -442,7 +442,7 @@ fn test_cli_cron_lifecycle() {
         let run_id = "cronrun_test_0001";
         let now_str = chrono::Utc::now().to_rfc3339();
         store
-            .record_cron_run_start(run_id, &cortex_core::JobId::from(job_id), &now_str)
+            .record_cron_run_start(run_id, &cortex_core::JobId::from(job_id), &now_str, None)
             .unwrap();
         store
             .record_cron_run_finish(run_id, "completed", &now_str, Some(150), Some("Done"), None)

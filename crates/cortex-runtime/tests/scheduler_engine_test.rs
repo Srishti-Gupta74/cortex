@@ -3,11 +3,15 @@
 
 use chrono::{Duration, TimeZone, Utc};
 use cortex_core::JobId;
+use cortex_runtime::agent::{AgentManager, AgentManifest, AgentModelConfig};
+use cortex_runtime::model::{MockModelProvider, ModelOutput, ToolCall};
 use cortex_runtime::scheduler::{
     CronExpression, JobRunStatus, JobStatus, OverlapPolicy, Schedule, SchedulerEngine,
     TriggerResult,
 };
 use cortex_runtime::storage::RunStore;
+use cortex_runtime::tool::{Tool, ToolDefinition, ToolRegistry, ToolResult};
+use serde_json::json;
 use std::sync::Arc;
 
 struct TempDirGuard(std::path::PathBuf);
@@ -726,4 +730,256 @@ fn test_find_job_ambiguous_prefix() {
     );
     assert!(err_str.contains(job1.id.as_str()));
     assert!(err_str.contains(job2.id.as_str()));
+}
+
+struct TestDiagnosticTool;
+impl Tool for TestDiagnosticTool {
+    fn definition(&self) -> &ToolDefinition {
+        static DEF: std::sync::OnceLock<ToolDefinition> = std::sync::OnceLock::new();
+        DEF.get_or_init(|| {
+            ToolDefinition::new(
+                "test_diagnostic",
+                "Runs system diagnostic and checks status",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "component": { "type": "string" }
+                    },
+                    "required": ["component"]
+                }),
+            )
+        })
+    }
+
+    fn execute(&self, input: &serde_json::Value) -> cortex_core::Result<ToolResult> {
+        let comp = input
+            .get("component")
+            .and_then(|v| v.as_str())
+            .unwrap_or("core");
+        Ok(ToolResult::success(format!("Diagnostic {} ok", comp)))
+    }
+}
+
+#[test]
+fn test_scheduler_dispatch_agent_loop_execution_and_event_linkage() {
+    let store = Arc::new(RunStore::in_memory().unwrap());
+    let model = MockModelProvider::new();
+
+    // Step 1: Model requests tool execution
+    model.queue_response(ModelOutput::ToolCalls(vec![ToolCall::new(
+        "call_diag_1",
+        "test_diagnostic",
+        json!({ "component": "storage" }),
+    )]));
+    // Step 2: Model returns final answer
+    model.queue_response(ModelOutput::FinalAnswer(
+        "System diagnostics completed successfully: storage nominal".to_string(),
+    ));
+
+    let registry = Arc::new(ToolRegistry::new());
+    registry.register_tool(TestDiagnosticTool).unwrap();
+
+    let engine = SchedulerEngine::new(Arc::clone(&store))
+        .with_model_provider(Arc::new(model))
+        .with_tool_registry(registry);
+
+    let job = engine
+        .register_job(
+            "Periodic Diagnostic",
+            "*/10 * * * *",
+            "Execute system diagnostics on storage",
+            OverlapPolicy::Skip,
+        )
+        .unwrap();
+
+    let trigger = engine.dispatch_job(&job.id, Utc::now()).unwrap();
+    let cron_run_id = match trigger {
+        TriggerResult::Started { run_id, .. } => run_id,
+        _ => panic!("expected trigger started"),
+    };
+
+    // Verify cron run record and trace linkage
+    let runs = engine.list_job_runs(&job.id, 10).unwrap();
+    assert_eq!(runs.len(), 1);
+    let run_record = &runs[0];
+    assert_eq!(run_record.id, cron_run_id);
+    assert_eq!(run_record.status, JobRunStatus::Completed);
+    assert_eq!(
+        run_record.output.as_deref(),
+        Some("System diagnostics completed successfully: storage nominal")
+    );
+
+    let execution_run_id = run_record
+        .run_id
+        .as_ref()
+        .expect("cron_job_runs.run_id must link to runs.id");
+
+    // Verify correlated execution run in SQLite runs table
+    let run_summary = store
+        .get_run(execution_run_id)
+        .unwrap()
+        .expect("run must exist in runs table");
+    assert_eq!(run_summary.status, "completed");
+    assert_eq!(run_summary.task, "Execute system diagnostics on storage");
+
+    // Verify full SQLite event tracing
+    let events = store.get_events(execution_run_id).unwrap();
+    assert_eq!(events.len(), 8);
+
+    assert_eq!(events[0].event.event_type(), "RunStarted");
+    assert_eq!(events[1].event.event_type(), "ModelRequest");
+    assert_eq!(events[2].event.event_type(), "ModelResponse");
+    assert_eq!(events[3].event.event_type(), "ToolStarted");
+    assert_eq!(events[4].event.event_type(), "ToolCompleted");
+    assert_eq!(events[5].event.event_type(), "ModelRequest");
+    assert_eq!(events[6].event.event_type(), "ModelResponse");
+    assert_eq!(events[7].event.event_type(), "RunCompleted");
+
+    // Verify sequences are strictly 1..=8
+    for (i, ev) in events.iter().enumerate() {
+        assert_eq!(ev.sequence, (i + 1) as u64);
+    }
+}
+
+#[test]
+fn test_scheduler_target_agent_resolution_and_fallback() {
+    let store = Arc::new(RunStore::in_memory().unwrap());
+    let agent_manager = Arc::new(AgentManager::new_with_store(Arc::clone(&store)));
+
+    let tmp_dir = std::env::temp_dir().join(format!("cortex_agent_res_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+
+    // Register primary agent
+    let manifest1 = AgentManifest::new(
+        "Security Scanner",
+        "Security Auditor",
+        &tmp_dir,
+        AgentModelConfig::new("mock", "mock-model"),
+    )
+    .with_system_prompt("You are a specialized security auditing agent.");
+    let _agent1 = agent_manager.create(manifest1).unwrap();
+
+    // Register secondary agent
+    let manifest2 = AgentManifest::new(
+        "Ops Specialist",
+        "DevOps Operator",
+        &tmp_dir,
+        AgentModelConfig::new("mock", "mock-model"),
+    )
+    .with_system_prompt("You are a dedicated infrastructure operations agent.");
+    let agent2 = agent_manager.create(manifest2).unwrap();
+
+    let model = MockModelProvider::new();
+    model.queue_response(ModelOutput::FinalAnswer(
+        "Security scan finished".to_string(),
+    ));
+    model.queue_response(ModelOutput::FinalAnswer("Ops run finished".to_string()));
+
+    let engine = SchedulerEngine::new(Arc::clone(&store))
+        .with_agent_manager(Arc::clone(&agent_manager))
+        .with_model_provider(Arc::new(model));
+
+    // Job 1: configured with agent2 explicitly
+    let job1 = engine
+        .register_job_with_agent(
+            "Ops Audit",
+            "0 3 * * *",
+            "Audit clusters",
+            OverlapPolicy::Skip,
+            Some(agent2.id.clone()),
+        )
+        .unwrap();
+    assert_eq!(job1.agent_id, Some(agent2.id));
+
+    let trigger1 = engine.dispatch_job(&job1.id, Utc::now()).unwrap();
+    assert!(matches!(trigger1, TriggerResult::Started { .. }));
+
+    let runs1 = engine.list_job_runs(&job1.id, 1).unwrap();
+    assert_eq!(runs1[0].output.as_deref(), Some("Security scan finished"));
+
+    // Job 2: fallback to default registered agent when agent_id is None
+    let job2 = engine
+        .register_job(
+            "General Maintenance",
+            "0 4 * * *",
+            "General health check",
+            OverlapPolicy::Skip,
+        )
+        .unwrap();
+    assert_eq!(job2.agent_id, None);
+
+    let trigger2 = engine.dispatch_job(&job2.id, Utc::now()).unwrap();
+    assert!(matches!(trigger2, TriggerResult::Started { .. }));
+
+    let runs2 = engine.list_job_runs(&job2.id, 1).unwrap();
+    assert_eq!(runs2[0].output.as_deref(), Some("Ops run finished"));
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+#[test]
+fn test_scheduler_dispatch_overlap_replace_and_cancel_active() {
+    let store = Arc::new(RunStore::in_memory().unwrap());
+    let engine = SchedulerEngine::new(Arc::clone(&store));
+
+    let job = engine
+        .register_job(
+            "Long Task",
+            "*/5 * * * *",
+            "Long running task",
+            OverlapPolicy::Replace,
+        )
+        .unwrap();
+
+    // Trigger run 1
+    let trigger1 = engine.trigger_job(&job.id, Utc::now()).unwrap();
+    let run1_id = match trigger1 {
+        TriggerResult::Started { run_id, .. } => run_id,
+        _ => panic!("expected started"),
+    };
+
+    // User or system cancels active job
+    let cancelled = engine.cancel_active_job(&job.id).unwrap();
+    assert!(cancelled);
+
+    let runs = engine.list_job_runs(&job.id, 10).unwrap();
+    assert_eq!(runs[0].id, run1_id);
+    assert_eq!(runs[0].status, JobRunStatus::Cancelled);
+}
+
+#[test]
+fn test_scheduler_tick_dispatches_through_agent_loop_when_model_configured() {
+    let store = Arc::new(RunStore::in_memory().unwrap());
+    let model = MockModelProvider::new();
+    model.queue_response(ModelOutput::FinalAnswer(
+        "Tick execution completed".to_string(),
+    ));
+
+    let engine = SchedulerEngine::new(Arc::clone(&store)).with_model_provider(Arc::new(model));
+
+    let target = Utc::now() + Duration::seconds(10);
+    let sched_str = format!("@once {}", target.to_rfc3339());
+    let job = engine
+        .register_job(
+            "Scheduled Tick",
+            &sched_str,
+            "Tick prompt",
+            OverlapPolicy::Skip,
+        )
+        .unwrap();
+
+    // Tick at/after scheduled target time: dispatches through AgentLoop!
+    let results = engine.tick(target + Duration::seconds(1)).unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0], TriggerResult::Started { .. }));
+
+    let runs = engine.list_job_runs(&job.id, 10).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].status, JobRunStatus::Completed);
+    assert_eq!(runs[0].output.as_deref(), Some("Tick execution completed"));
+    assert!(runs[0].run_id.is_some());
+
+    let exec_run_id = runs[0].run_id.as_ref().unwrap();
+    let stored_run = store.get_run(exec_run_id).unwrap().unwrap();
+    assert_eq!(stored_run.status, "completed");
 }

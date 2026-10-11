@@ -18,11 +18,12 @@ use std::path::Path;
 use std::sync::Mutex;
 
 /// Current schema migration version.
-pub const CURRENT_SCHEMA_VERSION: i32 = 4;
+pub const CURRENT_SCHEMA_VERSION: i32 = 5;
 const SCHEMA_V1: &str = include_str!("../migrations/001_initial_schema.sql");
 const SCHEMA_V2: &str = include_str!("../migrations/002_agents_and_checkpoints.sql");
 const SCHEMA_V3: &str = include_str!("../migrations/003_cron_scheduler.sql");
 const SCHEMA_V4: &str = include_str!("../migrations/004_multi_agent_tables.sql");
+const SCHEMA_V5: &str = include_str!("../migrations/005_cron_job_agent_id.sql");
 
 /// Persistent database record for an agent worker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,6 +255,22 @@ impl RunStore {
                 )
                 .map_err(|e| {
                     CortexError::Internal(format!("failed to record schema_version 4: {}", e))
+                })?;
+        }
+
+        if current_version < 5 {
+            transaction.execute_batch(SCHEMA_V5).map_err(|e| {
+                CortexError::Internal(format!("failed to apply migration 005: {}", e))
+            })?;
+
+            let now = Utc::now().to_rfc3339();
+            transaction
+                .execute(
+                    "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
+                    params![5, now],
+                )
+                .map_err(|e| {
+                    CortexError::Internal(format!("failed to record schema_version 5: {}", e))
                 })?;
         }
 
@@ -772,13 +789,14 @@ impl RunStore {
         let last_run_str = job.last_run_at.map(|dt| dt.to_rfc3339());
         let created_str = job.created_at.to_rfc3339();
         let updated_str = job.updated_at.to_rfc3339();
+        let agent_id_str = job.agent_id.as_ref().map(|id| id.as_str());
 
         conn.execute(
             r#"
             INSERT INTO cron_jobs (
                 id, name, schedule, prompt, overlap_policy, status,
-                next_run_at, last_run_at, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                next_run_at, last_run_at, created_at, updated_at, agent_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 schedule = excluded.schedule,
@@ -787,7 +805,8 @@ impl RunStore {
                 status = excluded.status,
                 next_run_at = excluded.next_run_at,
                 last_run_at = excluded.last_run_at,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                agent_id = excluded.agent_id
             "#,
             params![
                 job.id.as_str(),
@@ -800,6 +819,7 @@ impl RunStore {
                 last_run_str,
                 created_str,
                 updated_str,
+                agent_id_str,
             ],
         )
         .map_err(map_sql_err)?;
@@ -818,7 +838,7 @@ impl RunStore {
             .prepare(
                 r#"
                 SELECT id, name, schedule, prompt, overlap_policy, status,
-                       next_run_at, last_run_at, created_at, updated_at
+                       next_run_at, last_run_at, created_at, updated_at, agent_id
                 FROM cron_jobs
                 WHERE id = ?1
                 "#,
@@ -837,6 +857,7 @@ impl RunStore {
                 let last_run_str: Option<String> = row.get(7)?;
                 let created_str: String = row.get(8)?;
                 let updated_str: String = row.get(9)?;
+                let agent_id_str: Option<String> = row.get(10)?;
 
                 Ok((
                     id_str,
@@ -849,6 +870,7 @@ impl RunStore {
                     last_run_str,
                     created_str,
                     updated_str,
+                    agent_id_str,
                 ))
             })
             .map_err(map_sql_err)?;
@@ -865,6 +887,7 @@ impl RunStore {
                 last_run_str,
                 created_str,
                 updated_str,
+                agent_id_str,
             ) = r.map_err(map_sql_err)?;
 
             let overlap_policy =
@@ -883,6 +906,7 @@ impl RunStore {
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let agent_id = agent_id_str.map(AgentId::from);
 
             Ok(Some(ScheduledJob {
                 id: JobId::from(id_str),
@@ -895,6 +919,7 @@ impl RunStore {
                 last_run_at,
                 created_at,
                 updated_at,
+                agent_id,
             }))
         } else {
             Ok(None)
@@ -912,7 +937,7 @@ impl RunStore {
             .prepare(
                 r#"
                 SELECT id, name, schedule, prompt, overlap_policy, status,
-                       next_run_at, last_run_at, created_at, updated_at
+                       next_run_at, last_run_at, created_at, updated_at, agent_id
                 FROM cron_jobs
                 ORDER BY created_at ASC
                 "#,
@@ -931,6 +956,7 @@ impl RunStore {
                 let last_run_str: Option<String> = row.get(7)?;
                 let created_str: String = row.get(8)?;
                 let updated_str: String = row.get(9)?;
+                let agent_id_str: Option<String> = row.get(10)?;
 
                 Ok((
                     id_str,
@@ -943,6 +969,7 @@ impl RunStore {
                     last_run_str,
                     created_str,
                     updated_str,
+                    agent_id_str,
                 ))
             })
             .map_err(map_sql_err)?;
@@ -960,6 +987,7 @@ impl RunStore {
                 last_run_str,
                 created_str,
                 updated_str,
+                agent_id_str,
             ) = r.map_err(map_sql_err)?;
 
             let overlap_policy =
@@ -978,6 +1006,7 @@ impl RunStore {
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let agent_id = agent_id_str.map(AgentId::from);
 
             jobs.push(ScheduledJob {
                 id: JobId::from(id_str),
@@ -990,6 +1019,7 @@ impl RunStore {
                 last_run_at,
                 created_at,
                 updated_at,
+                agent_id,
             });
         }
 
@@ -1040,12 +1070,13 @@ impl RunStore {
         Ok(())
     }
 
-    /// Record initial execution of a scheduled cron run.
+    /// Record initial execution of a scheduled cron run with optional correlated execution run ID.
     pub fn record_cron_run_start(
         &self,
         run_id: &str,
         job_id: &JobId,
         started_at: &str,
+        execution_run_id: Option<&RunId>,
     ) -> Result<()> {
         let conn = self
             .conn
@@ -1054,10 +1085,15 @@ impl RunStore {
 
         conn.execute(
             r#"
-            INSERT INTO cron_job_runs (id, job_id, status, started_at)
-            VALUES (?1, ?2, 'running', ?3)
+            INSERT INTO cron_job_runs (id, job_id, status, started_at, run_id)
+            VALUES (?1, ?2, 'running', ?3, ?4)
             "#,
-            params![run_id, job_id.as_str(), started_at],
+            params![
+                run_id,
+                job_id.as_str(),
+                started_at,
+                execution_run_id.map(|r| r.as_str()),
+            ],
         )
         .map_err(map_sql_err)?;
 
@@ -1128,7 +1164,7 @@ impl RunStore {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, job_id, status, started_at, finished_at, duration_ms, output, error
+                SELECT id, job_id, status, started_at, finished_at, duration_ms, output, error, run_id
                 FROM cron_job_runs
                 WHERE job_id = ?1 AND status = 'running'
                 ORDER BY started_at DESC
@@ -1147,6 +1183,7 @@ impl RunStore {
                 let duration_ms: Option<u64> = row.get(5)?;
                 let output: Option<String> = row.get(6)?;
                 let error: Option<String> = row.get(7)?;
+                let run_id_str: Option<String> = row.get(8)?;
 
                 Ok((
                     id,
@@ -1157,13 +1194,23 @@ impl RunStore {
                     duration_ms,
                     output,
                     error,
+                    run_id_str,
                 ))
             })
             .map_err(map_sql_err)?;
 
         if let Some(r) = rows.next() {
-            let (id, job_id_str, status_str, started_str, finished_str, duration_ms, output, error) =
-                r.map_err(map_sql_err)?;
+            let (
+                id,
+                job_id_str,
+                status_str,
+                started_str,
+                finished_str,
+                duration_ms,
+                output,
+                error,
+                run_id_str,
+            ) = r.map_err(map_sql_err)?;
 
             let status = JobRunStatus::from_str(&status_str).unwrap_or(JobRunStatus::Running);
             let started_at = DateTime::parse_from_rfc3339(&started_str)
@@ -1172,10 +1219,12 @@ impl RunStore {
             let finished_at = finished_str
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
+            let run_id = run_id_str.map(RunId::from);
 
             Ok(Some(JobRunRecord {
                 id,
                 job_id: JobId::from(job_id_str),
+                run_id,
                 status,
                 started_at,
                 finished_at,
@@ -1198,7 +1247,7 @@ impl RunStore {
         let mut stmt = conn
             .prepare(
                 r#"
-                SELECT id, job_id, status, started_at, finished_at, duration_ms, output, error
+                SELECT id, job_id, status, started_at, finished_at, duration_ms, output, error, run_id
                 FROM cron_job_runs
                 WHERE job_id = ?1
                 ORDER BY started_at DESC
@@ -1217,6 +1266,7 @@ impl RunStore {
                 let duration_ms: Option<u64> = row.get(5)?;
                 let output: Option<String> = row.get(6)?;
                 let error: Option<String> = row.get(7)?;
+                let run_id_str: Option<String> = row.get(8)?;
 
                 Ok((
                     id,
@@ -1227,14 +1277,24 @@ impl RunStore {
                     duration_ms,
                     output,
                     error,
+                    run_id_str,
                 ))
             })
             .map_err(map_sql_err)?;
 
         let mut list = Vec::new();
         for r in rows {
-            let (id, job_id_str, status_str, started_str, finished_str, duration_ms, output, error) =
-                r.map_err(map_sql_err)?;
+            let (
+                id,
+                job_id_str,
+                status_str,
+                started_str,
+                finished_str,
+                duration_ms,
+                output,
+                error,
+                run_id_str,
+            ) = r.map_err(map_sql_err)?;
 
             let status = JobRunStatus::from_str(&status_str).unwrap_or(JobRunStatus::Completed);
             let started_at = DateTime::parse_from_rfc3339(&started_str)
@@ -1243,10 +1303,12 @@ impl RunStore {
             let finished_at = finished_str
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|dt| dt.with_timezone(&Utc));
+            let run_id = run_id_str.map(RunId::from);
 
             list.push(JobRunRecord {
                 id,
                 job_id: JobId::from(job_id_str),
+                run_id,
                 status,
                 started_at,
                 finished_at,
@@ -1322,7 +1384,7 @@ impl RunStore {
             .prepare(
                 r#"
                 SELECT id, name, schedule, prompt, overlap_policy, status,
-                       next_run_at, last_run_at, created_at, updated_at
+                       next_run_at, last_run_at, created_at, updated_at, agent_id
                 FROM cron_jobs
                 WHERE id LIKE ?1 || '%'
                 ORDER BY created_at ASC
@@ -1342,6 +1404,7 @@ impl RunStore {
                 let last_run_str: Option<String> = row.get(7)?;
                 let created_str: String = row.get(8)?;
                 let updated_str: String = row.get(9)?;
+                let agent_id_str: Option<String> = row.get(10)?;
 
                 Ok((
                     id_str,
@@ -1354,6 +1417,7 @@ impl RunStore {
                     last_run_str,
                     created_str,
                     updated_str,
+                    agent_id_str,
                 ))
             })
             .map_err(map_sql_err)?;
@@ -1371,6 +1435,7 @@ impl RunStore {
                 last_run_str,
                 created_str,
                 updated_str,
+                agent_id_str,
             ) = r.map_err(map_sql_err)?;
 
             let overlap_policy =
@@ -1389,6 +1454,7 @@ impl RunStore {
             let updated_at = DateTime::parse_from_rfc3339(&updated_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let agent_id = agent_id_str.map(AgentId::from);
 
             matches.push(ScheduledJob {
                 id: JobId::from(id_str),
@@ -1401,6 +1467,7 @@ impl RunStore {
                 last_run_at,
                 created_at,
                 updated_at,
+                agent_id,
             });
         }
 
