@@ -240,6 +240,7 @@ pub fn validate_schema(schema: &serde_json::Value, input: &serde_json::Value) ->
 pub struct ToolRegistry {
     tools: RwLock<HashMap<String, Arc<dyn Tool>>>,
     permissions: RwLock<Option<AgentPermissions>>,
+    approval_interceptor: RwLock<Option<Arc<crate::agent::ApprovalInterceptor>>>,
 }
 
 impl ToolRegistry {
@@ -248,6 +249,7 @@ impl ToolRegistry {
         Self {
             tools: RwLock::new(HashMap::new()),
             permissions: RwLock::new(None),
+            approval_interceptor: RwLock::new(None),
         }
     }
 
@@ -259,6 +261,17 @@ impl ToolRegistry {
         self
     }
 
+    /// Attach an approval interceptor to this tool registry.
+    pub fn with_approval_interceptor(
+        self,
+        interceptor: Arc<crate::agent::ApprovalInterceptor>,
+    ) -> Self {
+        if let Ok(mut lock) = self.approval_interceptor.write() {
+            *lock = Some(interceptor);
+        }
+        self
+    }
+
     /// Update runtime capability permissions for this registry.
     pub fn set_permissions(&self, permissions: Option<AgentPermissions>) {
         if let Ok(mut p) = self.permissions.write() {
@@ -266,9 +279,27 @@ impl ToolRegistry {
         }
     }
 
+    /// Update runtime approval interceptor for this registry.
+    pub fn set_approval_interceptor(
+        &self,
+        interceptor: Option<Arc<crate::agent::ApprovalInterceptor>>,
+    ) {
+        if let Ok(mut lock) = self.approval_interceptor.write() {
+            *lock = interceptor;
+        }
+    }
+
     /// Retrieve the currently configured capability permissions.
     pub fn permissions(&self) -> Option<AgentPermissions> {
         self.permissions.read().ok().and_then(|p| p.clone())
+    }
+
+    /// Retrieve the currently configured approval interceptor.
+    pub fn approval_interceptor(&self) -> Option<Arc<crate::agent::ApprovalInterceptor>> {
+        self.approval_interceptor
+            .read()
+            .ok()
+            .and_then(|i| i.clone())
     }
 
     /// Register a tool instance wrapped in an [`Arc`].
@@ -377,6 +408,11 @@ impl ToolRegistry {
         let active_perms = permissions.or(configured.as_ref());
         if let Some(perms) = active_perms {
             perms.validate_tool_call(name, input, tool.permission_level())?;
+        }
+
+        // Enforce interactive approval interceptor if configured
+        if let Some(interceptor) = self.approval_interceptor() {
+            interceptor.check_approval(name, input, None)?;
         }
 
         // Validate arguments against tool parameters schema

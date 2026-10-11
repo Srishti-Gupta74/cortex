@@ -25,10 +25,11 @@ pub use agent::{
     Agent, AgentCapability, AgentContext, AgentDescriptor, AgentEndpoint, AgentLifecycleEvent,
     AgentLoop, AgentManager, AgentManifest, AgentMessage, AgentMessagePayload, AgentModelConfig,
     AgentPermissions, AgentRegistry, AgentRunResult, AgentState, AgentYamlManifest, AgentYamlModel,
-    AgentYamlPermissions, BusMessage, CancellationToken, ChatMessage, DeadLetterEnvelope,
-    DeadLetterReason, MessageBus, MessageType, PermissionState, RoutingKey, SessionMetadata,
-    TaskPriority, TaskQueue, TaskStatus, TodoItem, WorkflowCoordinator, WorkflowTask,
-    YamlPermissionValue, CODING_AGENT_POLICY,
+    AgentYamlPermissions, ApprovalHandler, ApprovalInterceptor, ApprovalSessionState, BusMessage,
+    CallbackApprovalHandler, CancellationToken, ChatMessage, DeadLetterEnvelope, DeadLetterReason,
+    InteractiveApprovalHandler, MessageBus, MessageType, PermissionState, RoutingKey,
+    SessionMetadata, StaticApprovalHandler, TaskPriority, TaskQueue, TaskStatus, TodoItem,
+    WorkflowCoordinator, WorkflowTask, YamlPermissionValue, CODING_AGENT_POLICY,
 };
 pub use mcp::{CortexConfig, McpClient, McpConfig, McpManager, McpServerConfig, McpTool};
 pub use model::{

@@ -1,10 +1,12 @@
 //! Agent execution context, iteration coordinator, cancellation, and system policies.
 
+use super::approval::{ApprovalHandler, ApprovalInterceptor};
 use crate::model::{ModelOutput, ModelProvider, ToolCall};
 use crate::storage::RunStore;
 use crate::tool::{ToolDefinition, ToolRegistry};
 use crate::workspace::Workspace;
 use chrono::Utc;
+use cortex_core::permissions::ApprovalMode;
 use cortex_core::{CortexError, EventRecord, ExecutionEvent, Redactor, Result, RunId};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -109,6 +111,8 @@ pub struct AgentContext {
     pub permission_state: PermissionState,
     /// Configured capability permissions boundary.
     pub permissions: Option<super::manager::AgentPermissions>,
+    /// Active interactive approval interceptor for high-risk operations.
+    pub approval_interceptor: Option<Arc<ApprovalInterceptor>>,
     /// Session metadata and telemetry.
     pub session_metadata: SessionMetadata,
     /// Optional cancellation token for cooperative cancellation.
@@ -134,6 +138,7 @@ impl AgentContext {
             todos: Vec::new(),
             permission_state: PermissionState::default(),
             permissions: None,
+            approval_interceptor: None,
             session_metadata: SessionMetadata::default(),
             cancellation_token: None,
         }
@@ -167,6 +172,18 @@ impl AgentContext {
     /// Attach capability permissions to this execution context.
     pub fn with_permissions(mut self, permissions: super::manager::AgentPermissions) -> Self {
         self.permissions = Some(permissions);
+        self
+    }
+
+    /// Attach an approval interceptor to this execution context.
+    pub fn with_approval_interceptor(mut self, interceptor: Arc<ApprovalInterceptor>) -> Self {
+        self.approval_interceptor = Some(interceptor);
+        self
+    }
+
+    /// Set an approval mode for this execution context.
+    pub fn with_approval_mode(mut self, mode: ApprovalMode) -> Self {
+        self.approval_interceptor = Some(Arc::new(ApprovalInterceptor::from_mode(mode)));
         self
     }
 
@@ -278,6 +295,7 @@ pub struct AgentLoop {
     tool_start_callback: Option<ToolStartCallback>,
     tool_end_callback: Option<ToolEndCallback>,
     permissions: Option<super::manager::AgentPermissions>,
+    approval_interceptor: Option<Arc<ApprovalInterceptor>>,
 }
 
 impl AgentLoop {
@@ -292,6 +310,7 @@ impl AgentLoop {
             tool_start_callback: None,
             tool_end_callback: None,
             permissions: None,
+            approval_interceptor: None,
         }
     }
 
@@ -339,6 +358,30 @@ impl AgentLoop {
     /// Attach explicit capability permissions to this agent execution loop.
     pub fn with_permissions(mut self, permissions: super::manager::AgentPermissions) -> Self {
         self.permissions = Some(permissions);
+        self
+    }
+
+    /// Attach an approval interceptor to this agent execution loop.
+    pub fn with_approval_interceptor(mut self, interceptor: Arc<ApprovalInterceptor>) -> Self {
+        self.approval_interceptor = Some(interceptor);
+        self
+    }
+
+    /// Set an approval mode for this execution loop using default interceptors.
+    pub fn with_approval_mode(mut self, mode: ApprovalMode) -> Self {
+        self.approval_interceptor = Some(Arc::new(ApprovalInterceptor::from_mode(mode)));
+        self
+    }
+
+    /// Configure approval mode and optional custom handler for this execution loop.
+    pub fn with_approval_policy(
+        mut self,
+        mode: ApprovalMode,
+        handler: Option<Arc<dyn ApprovalHandler>>,
+    ) -> Self {
+        let handler =
+            handler.unwrap_or_else(|| Arc::new(super::approval::InteractiveApprovalHandler::new()));
+        self.approval_interceptor = Some(Arc::new(ApprovalInterceptor::new(mode, handler)));
         self
     }
 
@@ -595,9 +638,67 @@ impl AgentLoop {
                             cb(&call.name, &args_str);
                         }
 
-                        // Execute tool through registry with capability permissions validation
+                        // Enforce interactive approval policy for dangerous / high-risk operations
                         let active_perms =
                             self.permissions.as_ref().or(context.permissions.as_ref());
+                        let interceptor = self
+                            .approval_interceptor
+                            .as_ref()
+                            .or(context.approval_interceptor.as_ref());
+
+                        let approval_res = if let Some(interceptor) = interceptor {
+                            let ws_root = context.workspace.as_ref().map(|w| w.root());
+                            interceptor.check_approval(&call.name, &call.arguments, ws_root)
+                        } else if let Some(perms) = active_perms {
+                            if perms.approval_mode == cortex_core::permissions::ApprovalMode::Deny {
+                                let ws_root = context.workspace.as_ref().map(|w| w.root());
+                                let (risk, op_opt) = cortex_core::permissions::classify_operation(
+                                    &call.name,
+                                    &call.arguments,
+                                    ws_root,
+                                );
+                                if risk.is_high_risk() {
+                                    let reason = op_opt
+                                        .map(|o| o.reason)
+                                        .unwrap_or_else(|| "high-risk operation".to_string());
+                                    Err(CortexError::PermissionDenied(format!(
+                                        "high-risk operation '{}' rejected by approval policy (mode: deny): {}",
+                                        call.name, reason
+                                    )))
+                                } else {
+                                    Ok(())
+                                }
+                            } else {
+                                Ok(())
+                            }
+                        } else {
+                            Ok(())
+                        };
+
+                        if let Err(err) = approval_res {
+                            let err_msg = format!("execution error: {}", err);
+                            if let Some(cb) = &self.tool_end_callback {
+                                cb(&call.name, &err_msg, true);
+                            }
+                            if let Some(store) = &self.store {
+                                let ev = ExecutionEvent::ToolFailed {
+                                    run_id: context.run_id.clone(),
+                                    tool_name: call.name.clone(),
+                                    error: self.redactor.redact_text(&err_msg),
+                                };
+                                store.record_event(&EventRecord::new(sequence, ev))?;
+                                sequence += 1;
+                            }
+                            context.push_message(ChatMessage::ToolResult {
+                                call_id: call.id,
+                                tool_name: call.name,
+                                output: err_msg,
+                                is_error: true,
+                            });
+                            continue;
+                        }
+
+                        // Execute tool through registry with capability permissions validation
                         let tool_result = registry.execute_with_permissions(
                             &call.name,
                             &call.arguments,

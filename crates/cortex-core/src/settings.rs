@@ -17,6 +17,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_approval_mode() -> crate::permissions::ApprovalMode {
+    crate::permissions::ApprovalMode::Prompt
+}
+
 /// Primary user settings loaded from `~/.cortex/settings.json`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserSettings {
@@ -79,6 +83,14 @@ pub struct UserSettings {
     /// Whether to automatically persist chat sessions to `~/.cortex/sessions/`.
     #[serde(default = "default_true")]
     pub auto_save_sessions: bool,
+
+    /// Interactive approval mode for high-risk operations ("prompt", "deny", "allow"). Defaults to "prompt".
+    #[serde(
+        default = "default_approval_mode",
+        alias = "approval",
+        alias = "approval_policy"
+    )]
+    pub approval_mode: crate::permissions::ApprovalMode,
 }
 
 impl Default for UserSettings {
@@ -104,6 +116,7 @@ impl Default for UserSettings {
             system_prompt: None,
             theme: Some("blue".to_string()),
             auto_save_sessions: true,
+            approval_mode: crate::permissions::ApprovalMode::Prompt,
         }
     }
 }
@@ -407,5 +420,26 @@ mod tests {
         assert_eq!(loaded.max_iterations, 30);
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_approval_mode_settings() {
+        use crate::permissions::ApprovalMode;
+
+        let json_prompt = r#"{"model": "gpt-4o", "approval_mode": "prompt"}"#;
+        let s1: UserSettings = serde_json::from_str(json_prompt).unwrap();
+        assert_eq!(s1.approval_mode, ApprovalMode::Prompt);
+
+        let json_deny = r#"{"model": "gpt-4o", "approval": "deny"}"#;
+        let s2: UserSettings = serde_json::from_str(json_deny).unwrap();
+        assert_eq!(s2.approval_mode, ApprovalMode::Deny);
+
+        let json_allow = r#"{"model": "gpt-4o", "approval_policy": "allow"}"#;
+        let s3: UserSettings = serde_json::from_str(json_allow).unwrap();
+        assert_eq!(s3.approval_mode, ApprovalMode::Allow);
+
+        let json_default = r#"{"model": "gpt-4o"}"#;
+        let s4: UserSettings = serde_json::from_str(json_default).unwrap();
+        assert_eq!(s4.approval_mode, ApprovalMode::Prompt);
     }
 }

@@ -72,6 +72,9 @@ pub struct AgentPermissions {
     /// Allowed git operations (e.g. `["read", "commit"]`, `["read"]`, `["push"]`).
     #[serde(default)]
     pub git: Vec<String>,
+    /// Configured human-in-the-loop approval mode for high-risk operations.
+    #[serde(default)]
+    pub approval_mode: cortex_core::permissions::ApprovalMode,
 }
 
 impl AgentPermissions {
@@ -82,6 +85,7 @@ impl AgentPermissions {
             network: vec!["allow".to_string()],
             shell: vec!["*".to_string()],
             git: vec!["read".to_string(), "commit".to_string()],
+            approval_mode: cortex_core::permissions::ApprovalMode::Prompt,
         }
     }
 
@@ -92,7 +96,14 @@ impl AgentPermissions {
             network: Vec::new(),
             shell: Vec::new(),
             git: vec!["read".to_string()],
+            approval_mode: cortex_core::permissions::ApprovalMode::Prompt,
         }
+    }
+
+    /// Configure approval mode for this permission set.
+    pub fn with_approval_mode(mut self, mode: cortex_core::permissions::ApprovalMode) -> Self {
+        self.approval_mode = mode;
+        self
     }
 
     /// Check if filesystem read operations are permitted.
@@ -203,6 +214,20 @@ impl AgentPermissions {
         arguments: &serde_json::Value,
         level: crate::tool::PermissionLevel,
     ) -> Result<()> {
+        if self.approval_mode == cortex_core::permissions::ApprovalMode::Deny {
+            let (risk, op_opt) =
+                cortex_core::permissions::classify_operation(tool_name, arguments, None);
+            if risk.is_high_risk() {
+                let reason = op_opt
+                    .map(|o| o.reason)
+                    .unwrap_or_else(|| "high-risk operation".to_string());
+                return Err(CortexError::PermissionDenied(format!(
+                    "high-risk operation '{}' rejected by approval policy (mode: deny): {}",
+                    tool_name, reason
+                )));
+            }
+        }
+
         match tool_name {
             "read_file" | "list_dir" | "list_directory" => {
                 if !self.allows_filesystem_read() {
