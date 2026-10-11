@@ -50,6 +50,26 @@ Because Cortex executes actions autonomously, several capabilities present direc
 
 All high-risk capabilities require explicit configuration, strict capability checks, and, where configured, interactive human approval.
 
+### Interactive human-in-the-loop approval policy
+
+Cortex intercepts high-risk operations prior to execution using a multi-tiered approval policy mechanism:
+
+1. **Risk Tiers**:
+   - **High Risk**: Remote `git push`, file and directory deletions (`rm`, `del`, `delete_file`), outbound network requests (`curl`, `wget`, HTTP tools, remote git clones), arbitrary package installations (`pip`, `npm`, `cargo`, `gem`, `apt`, `brew`), and shell commands targeting paths outside designated workspaces or using directory traversal (`..`).
+   - **Low Risk**: Read-only repository inspection tools (`read_file`, `list_directory`, `git status`, `git diff`, `git log`, `grep`).
+
+2. **Policy Modes**:
+   - `prompt` (default): Interactively requests explicit authorization from the operator with options to allow once (`yes`), allow for the session (`always`), or reject (`no`).
+   - `deny`: Unconditionally rejects high-risk actions with a `PermissionDenied` error.
+   - `allow`: Permits high-risk actions without interactive confirmation (designed for isolated sandboxed runners and automated benchmarks).
+
+3. **Headless & Automation Safety**:
+   - When running in automated, unattended environments where standard input is not a TTY (such as CI workflows, background cron schedules, or automated test runners), `prompt` mode automatically falls back to `deny` to ensure operations cannot proceed without operator oversight.
+
+4. **Configuration Surfaces**:
+   - Global operator settings: `~/.cortex/settings.json` via `"approval_mode": "prompt" | "deny" | "allow"`.
+   - Per-agent YAML manifests: `agent.yaml` via `"approval": "prompt" | "deny" | "allow"` or `"approval_mode": ...`.
+
 ---
 
 ## 3. Sandboxing and defense in depth

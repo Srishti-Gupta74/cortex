@@ -1,5 +1,6 @@
-//! Agent execution context, iteration coordinator, cancellation, and persistent lifecycle management.
+//! Agent execution context, iteration coordinator, cancellation, approval interception, and persistent lifecycle management.
 
+pub mod approval;
 pub mod bus;
 pub mod coordination;
 pub mod execution;
@@ -10,6 +11,10 @@ pub mod message;
 pub mod registry;
 pub mod task_queue;
 
+pub use approval::{
+    ApprovalHandler, ApprovalInterceptor, ApprovalSessionState, CallbackApprovalHandler,
+    InteractiveApprovalHandler, StaticApprovalHandler,
+};
 pub use bus::{BusMessage, BusReceiver, DeadLetterEnvelope, DeadLetterReason, MessageBus};
 pub use coordination::{AgentEndpoint, AgentMessage};
 pub use execution::{

@@ -12,6 +12,7 @@
 pub mod error;
 pub mod event;
 pub mod id;
+pub mod permissions;
 pub mod redact;
 pub mod settings;
 pub mod workflow;
@@ -19,6 +20,10 @@ pub mod workflow;
 pub use error::{CortexError, Result};
 pub use event::{EventRecord, ExecutionEvent};
 pub use id::{AgentId, JobId, RunId, SessionId, WorkflowId};
+pub use permissions::{
+    classify_operation, is_interactive_terminal, ApprovalDecision, ApprovalMode, HighRiskOperation,
+    RiskLevel,
+};
 pub use redact::{Redactor, SecretRedactor};
 pub use settings::UserSettings;
 pub use workflow::{WorkflowAgentRef, WorkflowManifest, WorkflowStage};

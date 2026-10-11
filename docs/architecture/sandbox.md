@@ -56,6 +56,36 @@ permissions:
    - Granular permissions: `read` (`git_status`, `git_diff`, `git_log`), `commit` (`git_commit`, branch creation), and `push` (`git_push`).
    - **Strict Push Policy**: Git push is disabled by default and requires explicit authorization (`git.push: true` or `git: ["push"]`). Even standard presets reject remote pushes.
 
+## Interactive Human-in-the-Loop Approval Policy
+
+To protect systems from destructive or irreversible actions proposed by autonomous model agents, Cortex implements an interactive approval interception layer (`ApprovalInterceptor` in `cortex-runtime` and `permissions` in `cortex-core`).
+
+### High-Risk Operation Classification
+
+Operations are classified into risk tiers prior to execution:
+
+- **High-Risk Operations**:
+  - `git push`: Remote pushes via `git_push`, `git` with push op, or shell `git push`.
+  - **File Deletions**: File or directory deletions via `delete_file`, `remove_file`, `rm`, `del`, `Remove-Item`.
+  - **Outbound Network**: Outgoing network requests (`curl`, `wget`, `http_request`, `fetch`, `web_search`, `git clone`).
+  - **Arbitrary Package Installations**: Package manager execution (`pip install`, `npm install`, `cargo install/add`, `gem install`, `apt install`, `brew install`).
+  - **Outside Workspace Paths**: Directory traversals (`..`) or commands targeting absolute paths outside the assigned workspace.
+- **Low-Risk Operations**: Read-only inspections (`read_file`, `list_dir`, `git status`, `git diff`, `git log`, `grep`).
+
+### Approval Modes
+
+Operators configure authorization behavior globally in `~/.cortex/settings.json` or per-agent in `agent.yaml`:
+
+| Mode | Behavior | Use Case |
+| :--- | :--- | :--- |
+| `prompt` (default) | Prompts operator interactively (`[y]es`, `[n]o`, `[a]lways for session`). | Interactive CLI/TUI developer workflows. |
+| `deny` | Automatically rejects high-risk actions with `PermissionDenied`. | Strict unattended automation, safety evaluations. |
+| `allow` | Permits high-risk actions without interactive confirmation. | Sandboxed headless pipelines, benchmark runs. |
+
+### Headless & Automation Safety
+
+When running in automated environments where standard input is not connected to a terminal (`!is_terminal()`, such as CI pipelines, cron jobs, or headless daemon runs), the interactive `prompt` mode automatically falls back to `deny` to prevent hung processes or unauthorized execution.
+
 ## Runtime Enforcement Pipeline
 
 Runtime authorization is decoupled from model inference:
@@ -65,7 +95,8 @@ Runtime authorization is decoupled from model inference:
 |   Model Provider  | -----------------> |     AgentLoop     |
 +-------------------+                    +-------------------+
                                                    |
-                                       Active Permissions Checked
+                                       Approval Interceptor Checked
+                                       (prompt / deny / allow / TTY)
                                                    v
                                          +-------------------+
                                          |   ToolRegistry    |
@@ -79,9 +110,9 @@ Runtime authorization is decoupled from model inference:
                                                       +-------------------+
 ```
 
-1. **Pre-execution Interception**: Prior to argument schema validation or subprocess invocation, `ToolRegistry::execute_with_permissions` calls `AgentPermissions::validate_tool_call`.
-2. **Inviolable Security Boundary**: Model system prompts or user instructions cannot bypass capability enforcement. Prohibited tool requests immediately fail with `CortexError::PermissionDenied`.
-3. **Structured Auditability**: All permission denials are recorded as `ExecutionEvent::ToolFailed` events within persistent SQLite storage (`RunStore`), providing a verifiable audit log.
+1. **Pre-execution Interception**: Prior to argument schema validation or subprocess invocation, `ApprovalInterceptor::check_approval` and `ToolRegistry::execute_with_permissions` inspect the operation. High-risk actions in `prompt` mode require explicit user authorization.
+2. **Inviolable Security Boundary**: Model system prompts or user instructions cannot bypass capability enforcement or approval policies. Prohibited or rejected requests immediately fail with `CortexError::PermissionDenied`.
+3. **Structured Auditability**: All permission denials and approval rejections are recorded as `ExecutionEvent::ToolFailed` events within persistent SQLite storage (`RunStore`), providing a verifiable audit log.
 
 ## Execution Backends
 

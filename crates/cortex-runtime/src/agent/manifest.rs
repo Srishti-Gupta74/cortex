@@ -40,6 +40,12 @@ pub struct AgentYamlPermissions {
     /// Network destination permission.
     #[serde(default)]
     pub network: Option<YamlPermissionValue>,
+    /// Interactive approval mode for high-risk operations ("prompt", "deny", "allow").
+    #[serde(default, alias = "approval_policy")]
+    pub approval: Option<cortex_core::permissions::ApprovalMode>,
+    /// Explicit approval mode field.
+    #[serde(default)]
+    pub approval_mode: Option<cortex_core::permissions::ApprovalMode>,
 }
 
 impl AgentYamlPermissions {
@@ -151,11 +157,14 @@ impl AgentYamlPermissions {
             }
         }
 
+        let approval_mode = self.approval_mode.or(self.approval).unwrap_or_default();
+
         AgentPermissions {
             filesystem,
             network,
             shell,
             git,
+            approval_mode,
         }
     }
 }
@@ -229,6 +238,9 @@ pub struct AgentYamlManifest {
     /// Granted permission boundaries.
     #[serde(default)]
     pub permissions: AgentYamlPermissions,
+    /// Interactive approval mode override for high-risk operations ("prompt", "deny", "allow").
+    #[serde(default, alias = "approval")]
+    pub approval_mode: Option<cortex_core::permissions::ApprovalMode>,
     /// Whether to automatically resume on daemon restart if interrupted.
     #[serde(default)]
     pub auto_resume: bool,
@@ -345,7 +357,10 @@ impl AgentYamlManifest {
             manifest = manifest.with_system_prompt(prompt);
         }
 
-        let runtime_perms = self.permissions.to_runtime_permissions();
+        let mut runtime_perms = self.permissions.to_runtime_permissions();
+        if let Some(mode) = self.approval_mode {
+            runtime_perms.approval_mode = mode;
+        }
         let mut tools = self.tools;
         // If git_push is not permitted by capability permissions, strip git_push from tools
         if !runtime_perms.allows_git("push") {
