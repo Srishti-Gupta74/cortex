@@ -248,6 +248,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('8') => {
             app.set_tab(ActiveTab::Portals);
         }
+        KeyCode::Char('9') => {
+            app.set_tab(ActiveTab::Scheduler);
+        }
         KeyCode::Char('r') | KeyCode::Char('R') => {
             app.refresh();
             app.status_message = Some("Refreshed state from SQLite store.".to_string());
@@ -271,6 +274,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('p') if app.active_tab == ActiveTab::Agents => {
             app.pause_selected_agent();
         }
+        // Scheduler quick action shortcuts
+        KeyCode::Char('p') if app.active_tab == ActiveTab::Scheduler => {
+            app.toggle_pause_selected_cron_job();
+        }
+        KeyCode::Char('t') if app.active_tab == ActiveTab::Scheduler => {
+            app.trigger_selected_cron_job();
+        }
         // Portals quick action shortcuts in normal mode
         KeyCode::Char('a') if app.active_tab == ActiveTab::Portals => {
             app.start_adding_portal();
@@ -289,6 +299,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char(' ') if app.active_tab == ActiveTab::Portals => {
             app.activate_selected_portal();
+        }
+        KeyCode::Esc if app.active_tab == ActiveTab::Scheduler => {
+            if app.cron_drawer_open {
+                app.close_cron_drawer();
+            } else {
+                app.set_tab(ActiveTab::Dashboard);
+            }
         }
         KeyCode::Esc if app.active_tab != ActiveTab::Dashboard => {
             app.set_tab(ActiveTab::Dashboard);
@@ -354,6 +371,18 @@ mod tests {
         app2.set_tab(ActiveTab::Dashboard);
         handle_key(&mut app2, make_key(KeyCode::Tab));
         assert_eq!(app2.active_tab, ActiveTab::Agents);
+
+        handle_key(&mut app2, make_key(KeyCode::Char('9')));
+        assert_eq!(app2.active_tab, ActiveTab::Scheduler);
+
+        handle_key(&mut app2, make_key(KeyCode::Enter));
+        assert!(app2.cron_drawer_open);
+
+        handle_key(&mut app2, make_key(KeyCode::Esc));
+        assert!(!app2.cron_drawer_open);
+
+        handle_key(&mut app2, make_key(KeyCode::Esc));
+        assert_eq!(app2.active_tab, ActiveTab::Dashboard);
     }
 
     #[test]

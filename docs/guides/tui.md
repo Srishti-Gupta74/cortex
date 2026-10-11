@@ -90,6 +90,32 @@ The control plane contains 8 primary views accessible via numeric keys (`1` thro
 - **Credential & Endpoint Management**: Press `e` to set custom API keys, `b` to configure base endpoint URLs, `a` to create new portals, and `Space` / `Enter` to activate the target model for agent execution.
 - **Validation**: Press `t` to test configuration and verify connectivity.
 
+### 9. Cron Scheduler & Job Monitor (`9`)
+- **Summary Metrics**: High-level telemetry displaying total registered background jobs, active triggers, paused jobs, completed one-shots, and the earliest upcoming trigger countdown.
+- **Structured Job Table**: Columns displaying:
+  - **Job Name & ID**: Human-readable identifier and permanent JobId.
+  - **Schedule Expression**: Standard cron expression (e.g. `*/15 * * * *`, `0 2 * * *`) or `@once <timestamp>` one-shot specification.
+  - **Next Fire Countdown**: Human-friendly relative countdown (`in 14m 20s`, `in 2h 15m`, `Due now`, `Paused`, `Completed`).
+  - **Target Agent**: The resolved worker agent bound to execute the task (e.g. `coder-01`, `eval-01`, or default agent).
+  - **Overlap Policy**: Concurrency boundary (`Skip`, `Queue`, `Replace`).
+  - **Status**: Live lifecycle badge (`[ACTIVE]`, `[PAUSED]`, `[DONE]`).
+- **Interactive Execution Run Drawer**:
+  - Press `Enter` on any scheduled job to open/close the **Execution Runs Drawer**.
+  - Inspect recent execution attempts, correlated execution Run IDs (`runs.id`), duration, start timestamps, and output previews.
+  - Navigate execution attempts with `↑`/`↓` (`j`/`k`) to inspect detailed error traces and final answer summaries.
+  - Press `Esc` to collapse the drawer and return to the main table.
+- **Operator Actions**:
+  - `p`: Pause or resume the selected scheduled job in SQLite.
+  - `t`: Manually trigger the selected job immediately.
+  - `r`: Refresh jobs and execution runs directly from SQLite `RunStore`.
+
+### Slash Commands: `/cron` and `/scheduler`
+
+From the interactive Chat harness, background scheduled jobs can be inspected without leaving the prompt:
+- `/cron` (or `/scheduler`): Displays an ASCII card of all registered jobs, countdowns, agents, and overlap policies.
+- `/cron view`: One-step shortcut jumping directly to the interactive Scheduler control plane (Tab 9).
+- `/cron runs <id>`: Prints recent execution records and outputs for the specified job.
+
 ---
 
 ## Keyboard Controls
@@ -98,12 +124,12 @@ The control plane contains 8 primary views accessible via numeric keys (`1` thro
 |---|---|---|
 | `Tab` | Global | Cycle to next tab |
 | `Shift+Tab` / `BackTab` | Global | Cycle to previous tab |
-| `1` ..= `8` | Global / Normal | Jump directly to tab 1 through 8 |
+| `1` ..= `9` | Global / Normal | Jump directly to tab 1 through 9 |
 | `↑` / `k` | Normal | Move selection up in list/table |
 | `↓` / `j` | Normal | Move selection down in list/table |
-| `Enter` | Normal | Inspect selected run / activate portal |
+| `Enter` | Normal | Inspect selected run / activate portal / toggle drawer |
 | `r` | Normal | Refresh state from SQLite database |
-| `Esc` | Normal | Return to Dashboard |
+| `Esc` | Normal | Close drawer / return to Dashboard |
 | `q` / `Ctrl+C` | Global | Cleanly exit TUI |
 | `Enter` | Chat Tab | Dispatch agent with current input prompt |
 | `Esc` | Chat Tab | Cancel running agent / clear input prompt |
@@ -114,6 +140,10 @@ The control plane contains 8 primary views accessible via numeric keys (`1` thro
 | `b` | Portals Tab | Edit base endpoint URL for selected portal |
 | `d` | Portals Tab | Delete selected portal |
 | `t` | Portals Tab | Test portal credentials and configuration |
+| `Enter` | Scheduler Tab | Toggle Execution Runs Drawer for selected job |
+| `Esc` | Scheduler Tab | Close Execution Runs Drawer / navigate to Dashboard |
+| `p` | Scheduler Tab | Pause or resume the selected scheduled job |
+| `t` | Scheduler Tab | Immediately trigger selected job execution |
 
 ---
 
