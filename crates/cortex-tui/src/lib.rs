@@ -60,12 +60,18 @@ pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<(
         if crossterm::event::poll(std::time::Duration::from_millis(100))
             .map_err(|e| cortex_core::CortexError::Internal(format!("event poll error: {}", e)))?
         {
-            if let Event::Key(key) = crossterm::event::read().map_err(|e| {
+            match crossterm::event::read().map_err(|e| {
                 cortex_core::CortexError::Internal(format!("event read error: {}", e))
             })? {
-                if key.kind == KeyEventKind::Press {
-                    event::handle_key(&mut app, key);
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        event::handle_key(&mut app, key);
+                    }
                 }
+                Event::Mouse(mouse) => {
+                    event::handle_mouse(&mut app, mouse);
+                }
+                _ => {}
             }
         }
     }

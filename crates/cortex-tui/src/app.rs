@@ -1794,6 +1794,20 @@ impl App {
         }
     }
 
+    /// Scroll chat messages view upwards by a full page.
+    pub fn chat_scroll_page_up(&mut self) {
+        self.chat_auto_scroll = false;
+        self.chat_scroll = self.chat_scroll.saturating_add(15);
+    }
+
+    /// Scroll chat messages view downwards by a full page.
+    pub fn chat_scroll_page_down(&mut self) {
+        self.chat_scroll = self.chat_scroll.saturating_sub(15);
+        if self.chat_scroll == 0 {
+            self.chat_auto_scroll = true;
+        }
+    }
+
     /// Submit current chat input prompt or slash command.
     pub fn dispatch_chat(&mut self) {
         let prompt = self.chat_input.trim().to_string();

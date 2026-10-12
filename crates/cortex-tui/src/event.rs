@@ -1,7 +1,32 @@
 //! Keyboard event handling and navigation dispatch for the Cortex TUI.
 
 use crate::app::{ActiveTab, App, PortalInputMode};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+
+/// Handle mouse input events such as mouse wheel and trackpad scrolling across all tabs.
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.visualizer.is_open {
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            if app.active_tab == ActiveTab::Chat {
+                app.chat_scroll_up();
+            } else {
+                app.prev_item();
+            }
+        }
+        MouseEventKind::ScrollDown => {
+            if app.active_tab == ActiveTab::Chat {
+                app.chat_scroll_down();
+            } else {
+                app.next_item();
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Process a single keyboard event and update [`App`] state accordingly.
 pub fn handle_key(app: &mut App, key: KeyEvent) {
@@ -60,6 +85,30 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         // Handle Ctrl shortcuts first
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Up => {
+                    app.chat_scroll_up();
+                    return;
+                }
+                KeyCode::Down => {
+                    app.chat_scroll_down();
+                    return;
+                }
+                KeyCode::PageUp => {
+                    app.chat_scroll_page_up();
+                    return;
+                }
+                KeyCode::PageDown => {
+                    app.chat_scroll_page_down();
+                    return;
+                }
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    app.chat_history_prev();
+                    return;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    app.chat_history_next();
+                    return;
+                }
                 KeyCode::Char('t') | KeyCode::Char('T') => {
                     app.toggle_thinking_expanded();
                     return;
@@ -94,6 +143,30 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 }
                 KeyCode::Char('j') | KeyCode::Char('J') => {
                     app.chat_input_insert('\n');
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Handle Shift and Alt scroll shortcuts
+        if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT)
+        {
+            match key.code {
+                KeyCode::Up => {
+                    app.chat_scroll_up();
+                    return;
+                }
+                KeyCode::Down => {
+                    app.chat_scroll_down();
+                    return;
+                }
+                KeyCode::PageUp => {
+                    app.chat_scroll_page_up();
+                    return;
+                }
+                KeyCode::PageDown => {
+                    app.chat_scroll_page_down();
                     return;
                 }
                 _ => {}
@@ -156,6 +229,9 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                     app.autocomplete_close();
                 } else if app.chat_is_running {
                     app.cancel_chat_agent();
+                } else if app.chat_scroll > 0 {
+                    app.chat_scroll = 0;
+                    app.chat_auto_scroll = true;
                 } else if !app.chat_input.is_empty() {
                     app.chat_input_clear();
                 }
@@ -192,24 +268,32 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 app.chat_input_end();
             }
             KeyCode::PageUp => {
-                app.chat_scroll_up();
+                app.chat_scroll_page_up();
             }
             KeyCode::PageDown => {
-                app.chat_scroll_down();
+                app.chat_scroll_page_down();
             }
             KeyCode::Up => {
-                if app.chat_input.contains('\n') {
+                if app.chat_scroll > 0 {
+                    app.chat_scroll_up();
+                } else if app.chat_input.contains('\n') {
                     app.chat_input_up();
                 } else if !app.chat_history.is_empty()
                     && (app.chat_input.is_empty() || app.chat_history_idx.is_some())
                 {
-                    app.chat_history_prev();
+                    if app.chat_history_idx == Some(0) {
+                        app.chat_scroll_up();
+                    } else {
+                        app.chat_history_prev();
+                    }
                 } else {
                     app.chat_scroll_up();
                 }
             }
             KeyCode::Down => {
-                if app.chat_input.contains('\n') {
+                if app.chat_scroll > 0 {
+                    app.chat_scroll_down();
+                } else if app.chat_input.contains('\n') {
                     app.chat_input_down();
                 } else if app.chat_history_idx.is_some() {
                     app.chat_history_next();
@@ -564,5 +648,149 @@ mod tests {
         app.set_tab(ActiveTab::Dashboard);
         handle_key(&mut app, make_key(KeyCode::Char('v')));
         assert!(app.visualizer.is_open);
+    }
+
+    fn make_shift_key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::SHIFT,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn make_alt_key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::ALT,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    fn make_mouse_event(kind: MouseEventKind) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn test_mouse_scroll_chat_up_and_down() {
+        let mut app = App::new(None);
+        app.set_tab(ActiveTab::Chat);
+        assert_eq!(app.chat_scroll, 0);
+        assert!(app.chat_auto_scroll);
+        app.chat_history = vec!["prompt 1".to_string(), "prompt 2".to_string()];
+
+        // Mouse wheel scroll up increases chat_scroll without affecting chat_input or history
+        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollUp));
+        assert_eq!(app.chat_scroll, 3);
+        assert!(!app.chat_auto_scroll);
+        assert_eq!(app.chat_input, "");
+        assert_eq!(app.chat_history_idx, None);
+
+        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollUp));
+        assert_eq!(app.chat_scroll, 6);
+        assert_eq!(app.chat_input, "");
+
+        // Mouse wheel scroll down decreases chat_scroll
+        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollDown));
+        assert_eq!(app.chat_scroll, 3);
+
+        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollDown));
+        assert_eq!(app.chat_scroll, 0);
+        assert!(app.chat_auto_scroll);
+    }
+
+    #[test]
+    fn test_modifier_and_page_scroll_keys() {
+        let mut app = App::new(None);
+        app.set_tab(ActiveTab::Chat);
+        app.chat_history = vec!["historic prompt".to_string()];
+
+        // Shift+Up scrolls chat without cycling history
+        handle_key(&mut app, make_shift_key(KeyCode::Up));
+        assert_eq!(app.chat_scroll, 3);
+        assert_eq!(app.chat_input, "");
+
+        // Ctrl+Up scrolls chat
+        handle_key(&mut app, make_ctrl_key(KeyCode::Up));
+        assert_eq!(app.chat_scroll, 6);
+
+        // Alt+Up scrolls chat
+        handle_key(&mut app, make_alt_key(KeyCode::Up));
+        assert_eq!(app.chat_scroll, 9);
+
+        // PageUp scrolls by 15 lines
+        handle_key(&mut app, make_key(KeyCode::PageUp));
+        assert_eq!(app.chat_scroll, 24);
+
+        // PageDown scrolls down by 15 lines
+        handle_key(&mut app, make_key(KeyCode::PageDown));
+        assert_eq!(app.chat_scroll, 9);
+
+        // Esc resets scroll to bottom
+        handle_key(&mut app, make_key(KeyCode::Esc));
+        assert_eq!(app.chat_scroll, 0);
+        assert!(app.chat_auto_scroll);
+    }
+
+    #[test]
+    fn test_up_down_scrolling_transitions() {
+        let mut app = App::new(None);
+        app.set_tab(ActiveTab::Chat);
+        app.chat_history = vec!["prev 1".to_string(), "prev 2".to_string()];
+
+        // When at bottom with empty input, Up recalls the last prompt
+        handle_key(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.chat_input, "prev 2");
+        assert_eq!(app.chat_history_idx, Some(1));
+        assert_eq!(app.chat_scroll, 0);
+
+        // Up recalls earlier prompt
+        handle_key(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.chat_input, "prev 1");
+        assert_eq!(app.chat_history_idx, Some(0));
+        assert_eq!(app.chat_scroll, 0);
+
+        // At earliest prompt (idx 0), Up transitions into scrolling the message history
+        handle_key(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.chat_scroll, 3);
+
+        // While scrolled up (chat_scroll > 0), Up continues scrolling messages up
+        handle_key(&mut app, make_key(KeyCode::Up));
+        assert_eq!(app.chat_scroll, 6);
+
+        // While scrolled up, Down scrolls messages down
+        handle_key(&mut app, make_key(KeyCode::Down));
+        assert_eq!(app.chat_scroll, 3);
+
+        // Esc resets scroll to bottom
+        handle_key(&mut app, make_key(KeyCode::Esc));
+        assert_eq!(app.chat_scroll, 0);
+        assert!(app.chat_auto_scroll);
+    }
+
+    #[test]
+    fn test_ctrl_p_and_ctrl_n_history() {
+        let mut app = App::new(None);
+        app.set_tab(ActiveTab::Chat);
+        app.chat_history = vec!["first".to_string(), "second".to_string()];
+
+        handle_key(&mut app, make_ctrl_key(KeyCode::Char('p')));
+        assert_eq!(app.chat_input, "second");
+
+        handle_key(&mut app, make_ctrl_key(KeyCode::Char('p')));
+        assert_eq!(app.chat_input, "first");
+
+        handle_key(&mut app, make_ctrl_key(KeyCode::Char('n')));
+        assert_eq!(app.chat_input, "second");
+
+        handle_key(&mut app, make_ctrl_key(KeyCode::Char('n')));
+        assert_eq!(app.chat_input, "");
+        assert_eq!(app.chat_history_idx, None);
     }
 }

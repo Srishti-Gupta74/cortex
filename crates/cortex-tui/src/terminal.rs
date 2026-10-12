@@ -2,6 +2,7 @@
 
 use cortex_core::{CortexError, Result};
 use crossterm::cursor::{Hide, Show};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -25,7 +26,7 @@ impl TerminalGuard {
         })?;
 
         let mut out = stdout();
-        execute!(out, EnterAlternateScreen, Hide).map_err(|e| {
+        execute!(out, EnterAlternateScreen, EnableMouseCapture, Hide).map_err(|e| {
             let _ = disable_raw_mode();
             CortexError::Internal(format!("failed to enter alternate screen: {}", e))
         })?;
@@ -34,14 +35,14 @@ impl TerminalGuard {
         let original_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic_info| {
             let _ = disable_raw_mode();
-            let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+            let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
             original_hook(panic_info);
         }));
 
         let backend = CrosstermBackend::new(out);
         let terminal = Terminal::new(backend).map_err(|e| {
             let _ = disable_raw_mode();
-            let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+            let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
             CortexError::Internal(format!("failed to initialize ratatui terminal: {}", e))
         })?;
 
@@ -52,6 +53,6 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
     }
 }
