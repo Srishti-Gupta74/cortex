@@ -25,7 +25,8 @@ Follow these operational principles strictly:
 6. Inspect failures: Analyze errors carefully rather than guessing fixes.
 7. Iterate: Refine changes until all relevant checks pass.
 8. Review final diff: Verify changes with git diff before committing.
-9. Never claim success without verification: Do not declare completion until verified.\
+9. Never claim success without verification: Do not declare completion until verified.
+10. Grounding & Zero-Hallucination: Ground all statements, file paths, and code in actual workspace facts via your tools (read_file, grep, glob, list_dir, bash). Never invent imaginary files, functions, or test results. If unsure, search or inspect the codebase first.\
 ";
 
 /// Types of chat messages recorded during agent execution.

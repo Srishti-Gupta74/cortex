@@ -1855,6 +1855,38 @@ impl App {
             return;
         }
 
+        let mut history: Vec<cortex_runtime::agent::ChatMessage> = Vec::new();
+        let start_idx = self.chat_messages.len().saturating_sub(20);
+        for item in &self.chat_messages[start_idx..] {
+            match item.role {
+                ChatRole::User => {
+                    history.push(cortex_runtime::agent::ChatMessage::User(
+                        item.content.clone(),
+                    ));
+                }
+                ChatRole::Assistant => {
+                    if !item.content.trim().is_empty() {
+                        history.push(cortex_runtime::agent::ChatMessage::Assistant(
+                            item.content.clone(),
+                        ));
+                    }
+                }
+                ChatRole::Tool => {
+                    history.push(cortex_runtime::agent::ChatMessage::Assistant(format!(
+                        "Observation: {}",
+                        item.content
+                    )));
+                }
+                ChatRole::Error => {
+                    history.push(cortex_runtime::agent::ChatMessage::Assistant(format!(
+                        "Error: {}",
+                        item.content
+                    )));
+                }
+                ChatRole::System | ChatRole::Thinking => {}
+            }
+        }
+
         let now = chrono::Utc::now().format("%H:%M:%S").to_string();
         self.chat_messages.push(ChatMessageItem {
             role: ChatRole::User,
@@ -1877,21 +1909,19 @@ impl App {
             run_id: None,
         });
 
-        let store_clone = self.store.clone();
-        let model = active_portal.model_name.clone();
-        let api_key = active_portal.api_key.clone();
-        let base_url = active_portal.base_url.clone();
+        let params = ChatAgentExecutionParams {
+            prompt,
+            history,
+            model: active_portal.model_name.clone(),
+            api_key: active_portal.api_key.clone(),
+            base_url: active_portal.base_url.clone(),
+            store: self.store.clone(),
+            cancel_token,
+            sender,
+        };
 
         std::thread::spawn(move || {
-            execute_chat_agent(
-                prompt,
-                model,
-                api_key,
-                base_url,
-                store_clone,
-                cancel_token,
-                sender,
-            );
+            execute_chat_agent(params);
         });
     }
 
@@ -1930,13 +1960,16 @@ impl App {
     }
 
     /// Poll for real-time updates from background agent executions and event store.
-    pub fn poll_chat_updates(&mut self) {
+    /// Returns `true` if any real-time agent updates were received.
+    pub fn poll_chat_updates(&mut self) -> bool {
         self.anim_tick = self.anim_tick.wrapping_add(1);
         let mut finished = false;
         let mut new_run_id: Option<String> = None;
+        let mut received_any = false;
 
         if let Some(handle) = &mut self.chat_handle {
             while let Ok(update) = handle.receiver.try_recv() {
+                received_any = true;
                 let now = chrono::Utc::now().format("%H:%M:%S").to_string();
                 match update {
                     ChatAgentUpdate::Started { run_id, model } => {
@@ -2126,6 +2159,8 @@ impl App {
         } else if new_run_id.is_some() {
             self.refresh();
         }
+
+        received_any || finished
     }
 
     /// Record an inter-agent routed message into live coordination state.
@@ -2545,16 +2580,30 @@ impl Drop for App {
     }
 }
 
-/// Asynchronous worker executing the agent iteration loop in background.
-fn execute_chat_agent(
+/// Execution parameters for background chat agent worker.
+struct ChatAgentExecutionParams {
     prompt: String,
+    history: Vec<cortex_runtime::agent::ChatMessage>,
     model: String,
     api_key: Option<String>,
     base_url: Option<String>,
     store: Option<Arc<RunStore>>,
     cancel_token: CancellationToken,
     sender: Sender<ChatAgentUpdate>,
-) {
+}
+
+/// Asynchronous worker executing the agent iteration loop in background.
+fn execute_chat_agent(params: ChatAgentExecutionParams) {
+    let ChatAgentExecutionParams {
+        prompt,
+        history,
+        model,
+        api_key,
+        base_url,
+        store,
+        cancel_token,
+        sender,
+    } = params;
     let ws_path = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let ws = match Workspace::new(&ws_path) {
         Ok(w) => Arc::new(w),
@@ -2611,6 +2660,18 @@ fn execute_chat_agent(
     }
 
     let mut context = AgentContext::new(&prompt).with_workspace(ws);
+    // Ground context with multi-turn history to eliminate hallucinations across conversational turns
+    if !history.is_empty() {
+        let system_msg = context.messages.remove(0);
+        let user_msg = context.messages.pop();
+
+        let mut combined = vec![system_msg];
+        combined.extend(history);
+        if let Some(u) = user_msg {
+            combined.push(u);
+        }
+        context.messages = combined;
+    }
     let run_id = context.run_id.to_string();
 
     let _ = sender.send(ChatAgentUpdate::Started {

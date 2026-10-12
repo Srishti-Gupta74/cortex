@@ -44,35 +44,83 @@ pub fn run_tui(db_path: &Path) -> Result<()> {
 
 /// Run the TUI event loop on an initialized [`Terminal`] instance.
 pub fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> Result<()> {
-    loop {
-        app.poll_chat_updates();
+    let mut last_render = std::time::Instant::now();
 
-        terminal
-            .draw(|frame| ui::render(frame, &app))
-            .map_err(|e| {
-                cortex_core::CortexError::Internal(format!("terminal draw error: {}", e))
-            })?;
+    // Initial render
+    terminal
+        .draw(|frame| ui::render(frame, &app))
+        .map_err(|e| cortex_core::CortexError::Internal(format!("terminal draw error: {}", e)))?;
+
+    loop {
+        let chat_updated = app.poll_chat_updates();
+
+        // Responsive polling timeout: 16ms (~60 FPS) when chat agent is running to stream tokens/animations smoothly,
+        // or 50ms when idle to conserve CPU.
+        let poll_timeout = if app.chat_is_running {
+            std::time::Duration::from_millis(16)
+        } else {
+            std::time::Duration::from_millis(50)
+        };
+
+        let mut had_actionable_input = false;
+
+        if crossterm::event::poll(poll_timeout)
+            .map_err(|e| cortex_core::CortexError::Internal(format!("event poll error: {}", e)))?
+        {
+            // Drain ALL pending events in the queue in a single batch to prevent event lag and buffer saturation
+            loop {
+                match crossterm::event::read().map_err(|e| {
+                    cortex_core::CortexError::Internal(format!("event read error: {}", e))
+                })? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press {
+                            event::handle_key(&mut app, key);
+                            had_actionable_input = true;
+                        }
+                    }
+                    Event::Mouse(mouse) => {
+                        if event::handle_mouse(&mut app, mouse) {
+                            had_actionable_input = true;
+                        }
+                    }
+                    Event::Resize(_, _) => {
+                        had_actionable_input = true;
+                    }
+                    _ => {}
+                }
+
+                if app.should_quit {
+                    break;
+                }
+
+                // Check if any more events are immediately available in the queue without blocking
+                let more_events = crossterm::event::poll(std::time::Duration::from_millis(0))
+                    .map_err(|e| {
+                        cortex_core::CortexError::Internal(format!("event poll error: {}", e))
+                    })?;
+                if !more_events {
+                    break;
+                }
+            }
+        }
 
         if app.should_quit {
             break;
         }
 
-        if crossterm::event::poll(std::time::Duration::from_millis(100))
-            .map_err(|e| cortex_core::CortexError::Internal(format!("event poll error: {}", e)))?
-        {
-            match crossterm::event::read().map_err(|e| {
-                cortex_core::CortexError::Internal(format!("event read error: {}", e))
-            })? {
-                Event::Key(key) => {
-                    if key.kind == KeyEventKind::Press {
-                        event::handle_key(&mut app, key);
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    event::handle_mouse(&mut app, mouse);
-                }
-                _ => {}
-            }
+        let elapsed = last_render.elapsed();
+        let should_render = had_actionable_input
+            || chat_updated
+            || (app.chat_is_running && elapsed >= std::time::Duration::from_millis(16))
+            || elapsed >= std::time::Duration::from_millis(60);
+
+        if should_render {
+            terminal
+                .draw(|frame| ui::render(frame, &app))
+                .map_err(|e| {
+                    cortex_core::CortexError::Internal(format!("terminal draw error: {}", e))
+                })?;
+            last_render = std::time::Instant::now();
         }
     }
 
@@ -843,5 +891,40 @@ mod tests {
         assert!(content_tab2.contains("Model Output vs. Runtime Authority"));
         assert!(content_tab2.contains("Filesystem Jail"));
         assert!(content_tab2.contains("Subprocess Sandbox"));
+    }
+
+    #[test]
+    fn test_poll_chat_updates_idle() {
+        let mut app = App::new(None);
+        let tick_before = app.anim_tick;
+        // In idle state with no chat agent running, poll_chat_updates advances anim_tick and returns false
+        let updated = app.poll_chat_updates();
+        assert!(!updated);
+        assert_eq!(app.anim_tick, tick_before.wrapping_add(1));
+    }
+
+    #[test]
+    fn test_multi_turn_chat_message_preservation() {
+        let mut app = App::new(None);
+        app.set_tab(ActiveTab::Chat);
+
+        // Simulate multi-turn chat interaction
+        app.chat_messages.push(ChatMessageItem::new(
+            ChatRole::User,
+            "What is in AGENTS.md?",
+        ));
+        app.chat_messages.push(ChatMessageItem::new(
+            ChatRole::Tool,
+            "AGENTS.md defines coding standards and testing mandates.",
+        ));
+        app.chat_messages.push(ChatMessageItem::new(
+            ChatRole::Assistant,
+            "AGENTS.md mandates strict verification before committing.",
+        ));
+
+        assert_eq!(app.chat_messages.len(), 3);
+        assert_eq!(app.chat_messages[0].role, ChatRole::User);
+        assert_eq!(app.chat_messages[1].role, ChatRole::Tool);
+        assert_eq!(app.chat_messages[2].role, ChatRole::Assistant);
     }
 }

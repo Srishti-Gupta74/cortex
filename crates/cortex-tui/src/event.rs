@@ -4,9 +4,10 @@ use crate::app::{ActiveTab, App, PortalInputMode};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
 /// Handle mouse input events such as mouse wheel and trackpad scrolling across all tabs.
-pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+/// Returns `true` if an actionable mouse scroll event occurred, or `false` if ignored (e.g. movement or dragging).
+pub fn handle_mouse(app: &mut App, mouse: MouseEvent) -> bool {
     if app.visualizer.is_open {
-        return;
+        return false;
     }
 
     match mouse.kind {
@@ -16,6 +17,7 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             } else {
                 app.prev_item();
             }
+            true
         }
         MouseEventKind::ScrollDown => {
             if app.active_tab == ActiveTab::Chat {
@@ -23,8 +25,9 @@ pub fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             } else {
                 app.next_item();
             }
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -686,23 +689,37 @@ mod tests {
         app.chat_history = vec!["prompt 1".to_string(), "prompt 2".to_string()];
 
         // Mouse wheel scroll up increases chat_scroll without affecting chat_input or history
-        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollUp));
+        let acted = handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollUp));
+        assert!(acted);
         assert_eq!(app.chat_scroll, 3);
         assert!(!app.chat_auto_scroll);
         assert_eq!(app.chat_input, "");
         assert_eq!(app.chat_history_idx, None);
 
-        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollUp));
+        let acted = handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollUp));
+        assert!(acted);
         assert_eq!(app.chat_scroll, 6);
         assert_eq!(app.chat_input, "");
 
         // Mouse wheel scroll down decreases chat_scroll
-        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollDown));
+        let acted = handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollDown));
+        assert!(acted);
         assert_eq!(app.chat_scroll, 3);
 
-        handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollDown));
+        let acted = handle_mouse(&mut app, make_mouse_event(MouseEventKind::ScrollDown));
+        assert!(acted);
         assert_eq!(app.chat_scroll, 0);
         assert!(app.chat_auto_scroll);
+
+        // Non-scroll mouse events (e.g. movement, drag) are ignored and return false
+        assert!(!handle_mouse(
+            &mut app,
+            make_mouse_event(MouseEventKind::Moved)
+        ));
+        assert!(!handle_mouse(
+            &mut app,
+            make_mouse_event(MouseEventKind::Drag(crossterm::event::MouseButton::Left))
+        ));
     }
 
     #[test]
